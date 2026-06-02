@@ -1,0 +1,620 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Dalamud.Plugin;
+using Dalamud.Plugin.Ipc;
+using Dalamud.Plugin.Services;
+using Dalamud.Game.ClientState;
+using FFXIVClientStructs.FFXIV.Client.Game;
+using HousingMarketShopper.Models;
+
+
+namespace HousingMarketShopper.Services;
+
+/// <summary>
+/// Drives the automated shopping loop via Lifestream IPC and chat commands.
+/// All navigation (world travel, DC travel, MB entry) is delegated to Lifestream
+/// via <c>/li</c> commands — no vnavmesh dependency.
+/// </summary>
+public sealed class NavigationService : IDisposable
+{
+    // ── Lifestream IPC ────────────────────────────────────────────────────────
+    private ICallGateSubscriber<bool>? _lifestreamIsBusy;
+
+    private readonly ICommandManager    _commands;
+    private readonly IFramework         _framework;
+    private readonly MarketboardService _mb;
+    private readonly IObjectTable       _objects;
+    private readonly IClientState       _clientState;
+    private readonly IPluginLog         _log;
+    private readonly Configuration      _cfg;
+
+
+    // ── State ─────────────────────────────────────────────────────────────────
+    public bool   IsRunning     { get; private set; }
+    public bool   IsPaused      { get; private set; }
+    public string CurrentAction { get; private set; } = "";
+    public List<LogEntry> Log   { get; } = [];
+
+    /// <summary>True when the loop is paused specifically because inventory is nearly full.</summary>
+    public bool IsInventoryPause     { get; private set; }
+    /// <summary>Free slots at the time of the inventory pause.</summary>
+    public int  InventoryFreeSlots   { get; private set; }
+    /// <summary>Minimum extra slots the user needs to deposit before resuming.</summary>
+    public int  InventorySlotsNeeded { get; private set; }
+    /// <summary>Total items remaining in the plan at the time of the inventory pause.</summary>
+    public int  InventoryFutureItems { get; private set; }
+
+    public bool IpcReady => _lifestreamIsBusy != null;
+
+    /// <summary>
+    /// Items that were not fully purchased during the last shopping session.
+    /// Populated once the loop finishes (or is aborted/errored).
+    /// Cleared at the start of each new run.
+    /// </summary>
+    public List<ShoppingItem> MissedItems { get; } = [];
+
+    public event Action? StateChanged;
+
+    public NavigationService(
+        IDalamudPluginInterface pi,
+        ICommandManager         commands,
+        IFramework              framework,
+        MarketboardService      mb,
+        IObjectTable            objects,
+        IClientState            clientState,
+        Configuration           cfg,
+        IPluginLog              log)
+    {
+        _commands    = commands;
+        _framework   = framework;
+        _mb          = mb;
+        _objects     = objects;
+        _clientState = clientState;
+        _cfg         = cfg;
+        _log         = log;
+
+        try
+        {
+            _lifestreamIsBusy = pi.GetIpcSubscriber<bool>("Lifestream.IsBusy");
+        }
+        catch (Exception ex) { _log.Warning($"[HMS] Lifestream IPC unavailable: {ex.Message}"); }
+    }
+
+    // ── Shopping loop ─────────────────────────────────────────────────────────
+
+    public async Task RunShoppingLoopAsync(
+        ShoppingPlan     plan,
+        string?          currentDcName,
+        string?          currentWorldName,
+        Func<ShoppingItem, Task<bool>> confirmHighValue,
+        CancellationToken ct = default)
+    {
+        IsRunning = true;
+        IsPaused  = false;
+        MissedItems.Clear();
+        StateChanged?.Invoke();
+
+        // Tracks every overflow (re-routed) ShoppingItem created during the run
+        // so we can compute per-item purchased totals for the end-of-run summary.
+        var allOverflowItems = new List<ShoppingItem>();
+
+        try
+        {
+            var congestedWorlds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // Flatten plan worlds once for look-ahead calculations.
+            var allPlanWorlds = plan.Groups.SelectMany(g => g.Worlds).ToList();
+
+            for (var dcIdx = 0; dcIdx < plan.Groups.Count; dcIdx++)
+            {
+                if (ct.IsCancellationRequested) break;
+                var dcGroup = plan.Groups[dcIdx];
+
+                // fallbackQueue accumulates items re-routed away from congested worlds,
+                // keyed by the replacement world name.
+                var fallbackQueue = new Dictionary<string, List<ShoppingItem>>(
+                    StringComparer.OrdinalIgnoreCase);
+
+                for (var wIdx = 0; wIdx < dcGroup.Worlds.Count; wIdx++)
+                {
+                    if (ct.IsCancellationRequested) break;
+                    var worldGroup = dcGroup.Worlds[wIdx];
+
+                    // Items still pending on worlds that come AFTER this one in the plan.
+                    var futureItems = dcGroup.Worlds.Skip(wIdx + 1).Sum(w => w.PendingCount)
+                                    + plan.Groups.Skip(dcIdx + 1).SelectMany(g => g.Worlds).Sum(w => w.PendingCount);
+
+                    var thisWorldPending = worldGroup.PendingCount;
+
+                    // ── Predictive inventory check (Option C) ─────────────────
+                    if (_cfg.AutoInventoryPause)
+                        await CheckInventoryAndPauseAsync(
+                            worldGroup.WorldName, thisWorldPending, futureItems, ct);
+
+                    if (!string.Equals(worldGroup.WorldName, currentWorldName,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        var arrived = await TeleportToWorldAsync(worldGroup.WorldName, ct);
+                        if (!arrived)
+                        {
+                            congestedWorlds.Add(worldGroup.WorldName);
+                            LogAction($"⚠ {worldGroup.WorldName} is congested — re-routing items.", LogTag.Warning);
+                            foreach (var i in worldGroup.Items)
+                            {
+                                var alt = FindFallbackWorld(i, congestedWorlds);
+                                if (alt == null)
+                                {
+                                    i.Status = PurchaseStatus.Skipped;
+                                    LogAction($"  No fallback for {i.Name} — skipped.", LogTag.Error);
+                                }
+                                else
+                                {
+                                    if (!fallbackQueue.ContainsKey(alt)) fallbackQueue[alt] = [];
+                                    fallbackQueue[alt].Add(i);
+                                    LogAction($"  {i.Name} → {alt}", LogTag.Warning);
+                                }
+                            }
+                            continue;
+                        }
+                        currentWorldName = worldGroup.WorldName;
+                    }
+
+                    await NavigateToMarketboardAsync(ct);
+                    await PurchaseWorldItemsAsync(worldGroup.Items, confirmHighValue,
+                        fallbackQueue, allOverflowItems, congestedWorlds, worldGroup.WorldName, ct);
+
+                    if (!ct.IsCancellationRequested)
+                        await _mb.CloseMarketboardAsync(ct);
+                }
+
+                // Drain the fallback queue. PurchaseWorldItemsAsync may add new entries
+                // (chained re-routes), so we loop until the queue is fully empty rather
+                // than using a single foreach (which cannot see entries added mid-iteration).
+                while (fallbackQueue.Count > 0 && !ct.IsCancellationRequested)
+                {
+                    // Snapshot current entries and clear so new re-routes go into the
+                    // same dict and are picked up on the next iteration of this while loop.
+                    var batch = fallbackQueue.ToList();
+                    fallbackQueue.Clear();
+
+                    foreach (var (fallbackWorld, items) in batch)
+                    {
+                        if (ct.IsCancellationRequested) break;
+
+                        if (_cfg.AutoInventoryPause)
+                            await CheckInventoryAndPauseAsync(
+                                fallbackWorld, items.Count(i => i.Status == PurchaseStatus.Pending), 0, ct);
+
+                        if (!string.Equals(fallbackWorld, currentWorldName,
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            var arrived = await TeleportToWorldAsync(fallbackWorld, ct);
+                            if (!arrived)
+                            {
+                                congestedWorlds.Add(fallbackWorld);
+                                LogAction($"⚠ Fallback world {fallbackWorld} also congested — items skipped.", LogTag.Error);
+                                foreach (var i in items) i.Status = PurchaseStatus.Skipped;
+                                continue;
+                            }
+                            currentWorldName = fallbackWorld;
+                        }
+
+                        await NavigateToMarketboardAsync(ct);
+                        await PurchaseWorldItemsAsync(items, confirmHighValue,
+                            fallbackQueue, allOverflowItems, congestedWorlds, fallbackWorld, ct);
+
+                        if (!ct.IsCancellationRequested)
+                            await _mb.CloseMarketboardAsync(ct);
+                    }
+                }
+            }
+
+            LogAction("Shopping complete!", LogTag.Success);
+        }
+        catch (OperationCanceledException)
+        {
+            LogAction("Shopping aborted.", LogTag.Warning);
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"[HMS] Shopping loop error: {ex}");
+            LogAction($"Error: {ex.Message}");
+        }
+        finally
+        {
+            BuildMissedItemsSummary(plan, allOverflowItems);
+            IsRunning = false;
+            StateChanged?.Invoke();
+        }
+    }
+
+    private async Task PurchaseWorldItemsAsync(
+        IEnumerable<ShoppingItem>              items,
+        Func<ShoppingItem, Task<bool>>         confirmHighValue,
+        Dictionary<string, List<ShoppingItem>> fallbackQueue,
+        List<ShoppingItem>                     allOverflowItems,
+        HashSet<string>                        congestedWorlds,
+        string                                 currentWorld,
+        CancellationToken                      ct)
+    {
+        foreach (var item in items)
+        {
+            if (ct.IsCancellationRequested) break;
+            await WaitWhilePausedAsync(ct);
+
+            // Emergency inventory check — catches unexpected overflows mid-world.
+            if (_cfg.AutoInventoryPause)
+            {
+                var free = await GetFreeInventorySlotsAsync();
+                if (free <= _cfg.InventoryEmergencyThreshold)
+                    await CheckInventoryAndPauseAsync(currentWorld, 1, 0, ct);
+            }
+
+            if (item.IsHighValue && !item.PurchaseConfirmed)
+            {
+                var confirmed = await confirmHighValue(item);
+                if (!confirmed)
+                {
+                    item.Status = PurchaseStatus.Skipped;
+                    LogAction($"Skipped: {item.Name} ({item.PricePerUnit:N0} gil)", LogTag.Warning);
+                    continue;
+                }
+                item.PurchaseConfirmed = true;
+            }
+
+            await PurchaseItemAsync(item, ct);
+
+            // Re-route if partially purchased OR not listed at all on this world.
+            var needsReroute = item.Status == PurchaseStatus.Partial
+                            || item.Status == PurchaseStatus.NotListed;
+            if (needsReroute)
+            {
+                var remaining = item.Status == PurchaseStatus.NotListed
+                    ? item.QuantityNeeded
+                    : item.QuantityNeeded - item.QuantityPurchased;
+
+                var altWorld = item.AvailableListings
+                    .Where(l => !l.WorldName.Equals(currentWorld, StringComparison.OrdinalIgnoreCase)
+                             && !congestedWorlds.Contains(l.WorldName))
+                    .OrderBy(l => l.PricePerUnit)
+                    .FirstOrDefault()?.WorldName;
+
+                if (altWorld != null)
+                {
+                    var overflow = new ShoppingItem
+                    {
+                        Name              = item.Name,
+                        DyeName           = item.DyeName,
+                        ItemId            = item.ItemId,
+                        QuantityNeeded    = remaining,
+                        PricePerUnit      = item.PricePerUnit,
+                        TotalPrice        = item.PricePerUnit * remaining,
+                        IsHighValue       = item.IsHighValue,
+                        PurchaseConfirmed = item.PurchaseConfirmed,
+                        AvailableListings = item.AvailableListings,
+                        ResolveQuality    = item.ResolveQuality,
+                    };
+                    if (!fallbackQueue.ContainsKey(altWorld)) fallbackQueue[altWorld] = [];
+                    fallbackQueue[altWorld].Add(overflow);
+                    allOverflowItems.Add(overflow); // track for end-of-run summary
+                    LogAction($"  Routing {remaining}× {item.Name} → {altWorld}", LogTag.Warning);
+                }
+                else
+                {
+                    LogAction($"  No alternate source for remaining {remaining}× {item.Name}", LogTag.Error);
+                }
+            }
+        }
+    }
+
+    private static string? FindFallbackWorld(ShoppingItem item, HashSet<string> exclude)
+    {
+        return item.AvailableListings
+            .Where(l => !exclude.Contains(l.WorldName))
+            .OrderBy(l => l.PricePerUnit)
+            .FirstOrDefault()
+            ?.WorldName;
+    }
+
+    public void Pause()  { IsPaused = true;  StateChanged?.Invoke(); }
+    public void Resume() { IsPaused = false; StateChanged?.Invoke(); }
+    public void Stop()   { IsRunning = false; IsPaused = false; StateChanged?.Invoke(); }
+
+    // ── Navigation primitives ─────────────────────────────────────────────────
+
+    private async Task<bool> TeleportToWorldAsync(string worldName, CancellationToken ct)
+    {
+        LogAction($"Teleporting to {worldName}…", LogTag.Navigation);
+        try
+        {
+            await _framework.RunOnFrameworkThread(
+                () => _commands.ProcessCommand($"/li {worldName}"));
+        }
+        catch (Exception ex) { _log.Warning($"[HMS] Teleport error: {ex.Message}"); }
+
+        await WaitForLifestreamAsync(ct);
+        var arrived = await WaitForWorldAsync(worldName, ct);
+        if (arrived)
+            await Task.Delay(_cfg.NavigationDelayMs, ct);
+        return arrived;
+    }
+
+    private async Task NavigateToMarketboardAsync(CancellationToken ct)
+    {
+        // Ul'dah - Steps of Nald = 130, Steps of Thal = 131
+        var territory = await _framework.RunOnFrameworkThread(() => _clientState.TerritoryType);
+        if (territory != 130 && territory != 131)
+        {
+            LogAction("Teleporting to Ul'dah…", LogTag.Navigation);
+            try
+            {
+                await _framework.RunOnFrameworkThread(
+                    () => _commands.ProcessCommand("/li Ul'dah - Steps of Nald"));
+            }
+            catch (Exception ex) { _log.Warning($"[HMS] Ul'dah teleport error: {ex.Message}"); }
+
+            await WaitForLifestreamAsync(ct);
+            await Task.Delay(_cfg.NavigationDelayMs, ct);
+        }
+
+        // Brief settle so Lifestream is ready to accept a new command after world travel.
+        await Task.Delay(2_000, ct);
+
+        LogAction("Moving to marketboard…", LogTag.Navigation);
+        try
+        {
+            await _framework.RunOnFrameworkThread(
+                () => _commands.ProcessCommand("/li mb"));
+        }
+        catch (Exception ex) { _log.Warning($"[HMS] MB navigation error: {ex.Message}"); }
+
+        // Wait for Lifestream to open ItemSearch (it navigates to the board AND opens it).
+        var opened = await _mb.WaitForItemSearchOpenAsync(90_000, ct);
+        if (!opened)
+            _log.Warning("[HMS] Timed out waiting for ItemSearch to open after /li mb.");
+        await Task.Delay(_cfg.NavigationDelayMs, ct);
+    }
+
+    private async Task PurchaseItemAsync(ShoppingItem item, CancellationToken ct)
+    {
+        LogAction($"Purchasing {item.QuantityNeeded}× {item.Name} @ {item.PricePerUnit:N0} gil…", LogTag.Purchase);
+
+        // For high-value confirmed items apply the same 20% price-drift tolerance that
+        // MarketboardService.InitiatePurchaseUnsafe allows, so listings slightly above the
+        // Universalis snapshot pass the candidate filter and are not incorrectly rejected.
+        // For auto-approve items MaxPriceAutoApprove is the user's hard budget ceiling.
+        var maxPpu = item.IsHighValue
+            ? (int)(item.PricePerUnit * 1.20f)
+            : _cfg.MaxPriceAutoApprove;
+
+        var result = await _mb.PurchaseItemQuantityAsync(
+            (uint)item.ItemId, item.Name, item.QuantityNeeded, maxPpu, ct);
+
+        item.QuantityPurchased = result.QuantityPurchased;
+        item.ActualSpend       = result.TotalSpent;
+        item.Status = result.Outcome switch
+        {
+            PurchaseOutcome.Success      => PurchaseStatus.Purchased,
+            PurchaseOutcome.Partial      => PurchaseStatus.Partial,
+            PurchaseOutcome.Cancelled    => PurchaseStatus.Skipped,
+            PurchaseOutcome.NotListed    => PurchaseStatus.NotListed,
+            PurchaseOutcome.PriceChanged => PurchaseStatus.Failed,
+            _                            => PurchaseStatus.Failed,
+        };
+
+        var (statusStr, statusTag) = result.Outcome switch
+        {
+            PurchaseOutcome.Success   => ($"✓ {result.QuantityPurchased}× for {result.TotalSpent:N0} gil", LogTag.Success),
+            PurchaseOutcome.Partial   => ($"~ {result.QuantityPurchased}/{item.QuantityNeeded}× for {result.TotalSpent:N0} gil", LogTag.Partial),
+            PurchaseOutcome.NotListed => ("✗ not listed", LogTag.Warning),
+            _                         => ($"✗ {result.Outcome}: {result.FailureReason}", LogTag.Error),
+        };
+
+        LogAction($"  {item.Name}: {statusStr}", statusTag);
+        StateChanged?.Invoke();
+    }
+
+    // ── Wait helpers ──────────────────────────────────────────────────────────
+
+    private async Task WaitForLifestreamAsync(CancellationToken ct)
+    {
+        await Task.Delay(1500, ct);
+        var timeout = DateTime.UtcNow.AddSeconds(90);
+        while (DateTime.UtcNow < timeout)
+        {
+            if (ct.IsCancellationRequested) return;
+            bool busy;
+            try   { busy = _lifestreamIsBusy?.InvokeFunc() ?? false; }
+            catch { busy = false; }
+            if (!busy) break;
+            await Task.Delay(500, ct);
+        }
+        await Task.Delay(_cfg.NavigationDelayMs, ct);
+    }
+
+    private async Task<bool> WaitForWorldAsync(string worldName, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow.AddMinutes(2);
+        while (!ct.IsCancellationRequested)
+        {
+            // While paused, keep extending the deadline so manual teleports don't time out.
+            if (IsPaused)
+            {
+                deadline = DateTime.UtcNow.AddMinutes(2);
+                await Task.Delay(500, ct);
+                continue;
+            }
+
+            if (DateTime.UtcNow > deadline)
+                break;
+
+            string? current = null;
+            try
+            {
+                current = await _framework.RunOnFrameworkThread(
+                    () => _objects.LocalPlayer?.CurrentWorld.ValueNullable?.Name.ToString());
+            }
+            catch { /* ignore */ }
+
+            if (string.Equals(current, worldName, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            await Task.Delay(1000, ct);
+        }
+        _log.Warning($"[HMS] Timed out waiting to arrive on {worldName} — likely congested.");
+        return false;
+    }
+
+    private async Task WaitWhilePausedAsync(CancellationToken ct)
+    {
+        while (IsPaused && !ct.IsCancellationRequested)
+            await Task.Delay(200, ct);
+    }
+
+    // ── Inventory management ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Predictive inventory check. Loops until the player has deposited enough
+    /// items that <c>freeSlots - slotsNeededHere ≥ InventoryPauseThreshold</c>.
+    /// </summary>
+    private async Task CheckInventoryAndPauseAsync(
+        string worldName, int slotsNeededHere, int futureItems, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var free = await GetFreeInventorySlotsAsync();
+            var projectedAfter = free - slotsNeededHere;
+
+            if (projectedAfter >= _cfg.InventoryPauseThreshold)
+                return; // enough room — proceed
+
+            // Calculate how many slots the player needs to free up.
+            var needed = _cfg.InventoryPauseThreshold - projectedAfter;
+
+            InventoryFreeSlots   = free;
+            InventorySlotsNeeded = needed;
+            InventoryFutureItems = futureItems;
+            IsInventoryPause     = true;
+
+            LogAction(
+                $"⚠ Inventory: {free} free, ~{slotsNeededHere} needed for {worldName} " +
+                $"(+{futureItems} items remain after). Deposit ≥{needed} items then Resume.",
+                LogTag.Warning);
+
+            IsPaused = true;
+            StateChanged?.Invoke();
+            await WaitWhilePausedAsync(ct);
+
+            // Re-check after resume — the player may not have deposited enough.
+            IsInventoryPause = false;
+            StateChanged?.Invoke();
+        }
+    }
+
+    private async Task<int> GetFreeInventorySlotsAsync()
+    {
+        try
+        {
+            return await _framework.RunOnFrameworkThread(GetFreeInventorySlotsUnsafe);
+        }
+        catch { return 999; }
+    }
+
+    private static unsafe int GetFreeInventorySlotsUnsafe()
+    {
+        var mgr = InventoryManager.Instance();
+        if (mgr == null) return 999;
+
+        var free = 0;
+        foreach (var bagType in (ReadOnlySpan<InventoryType>)[
+            InventoryType.Inventory1, InventoryType.Inventory2,
+            InventoryType.Inventory3, InventoryType.Inventory4])
+        {
+            var container = mgr->GetInventoryContainer(bagType);
+            if (container == null) continue;
+            for (var i = 0; i < container->Size; i++)
+            {
+                var slot = container->GetInventorySlot(i);
+                if (slot != null && slot->ItemId == 0) free++;
+            }
+        }
+        return free;
+    }
+
+    /// <summary>Teleports to Ul'dah so the player can deposit at their retainer.</summary>
+    public async Task TeleportToDepositLocationAsync()
+    {
+        try
+        {
+            await _framework.RunOnFrameworkThread(
+                () => _commands.ProcessCommand("/li Ul'dah - Steps of Nald"));
+        }
+        catch (Exception ex) { _log.Warning($"[HMS] Deposit teleport error: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Aggregates purchased vs needed quantities across original plan items and every
+    /// overflow (re-routed) item. Items where total purchased &lt; total needed are
+    /// written into <see cref="MissedItems"/> for display in the Progress tab.
+    /// </summary>
+    private void BuildMissedItemsSummary(ShoppingPlan plan, List<ShoppingItem> overflowItems)
+    {
+        MissedItems.Clear();
+
+        // Accumulate per ItemId using the original plan as the source of truth for
+        // QuantityNeeded (overflow items carry only the re-routed remainder, which is
+        // already a subset of the original quantity).
+        var totalNeeded    = new Dictionary<int, int>();
+        var totalPurchased = new Dictionary<int, int>();
+        var itemMeta       = new Dictionary<int, ShoppingItem>(); // name/dye info
+
+        foreach (var item in plan.Groups
+                                 .SelectMany(g => g.Worlds)
+                                 .SelectMany(w => w.Items))
+        {
+            totalNeeded[item.ItemId]    = totalNeeded.GetValueOrDefault(item.ItemId)    + item.QuantityNeeded;
+            totalPurchased[item.ItemId] = totalPurchased.GetValueOrDefault(item.ItemId) + item.QuantityPurchased;
+            itemMeta.TryAdd(item.ItemId, item);
+        }
+
+        // Add purchases made by overflow (fallback) items — their QuantityNeeded is
+        // already counted in the original, only add what they actually bought.
+        foreach (var item in overflowItems)
+        {
+            totalPurchased[item.ItemId] = totalPurchased.GetValueOrDefault(item.ItemId) + item.QuantityPurchased;
+            itemMeta.TryAdd(item.ItemId, item);
+        }
+
+        foreach (var (itemId, needed) in totalNeeded)
+        {
+            var purchased = totalPurchased.GetValueOrDefault(itemId);
+            if (purchased >= needed) continue;
+
+            var meta = itemMeta[itemId];
+            MissedItems.Add(new ShoppingItem
+            {
+                ItemId         = meta.ItemId,
+                Name           = meta.Name,
+                DyeName        = meta.DyeName,
+                QuantityNeeded = needed - purchased,
+                ResolveQuality = meta.ResolveQuality,
+            });
+        }
+
+        if (MissedItems.Count > 0)
+            LogAction($"⚠ {MissedItems.Count} item type(s) not fully purchased — see missed items list.", LogTag.Warning);
+    }
+
+    private void LogAction(string msg, LogTag tag = LogTag.Info)
+    {
+        CurrentAction = msg;
+        Log.Add(new LogEntry($"[{DateTime.Now:HH:mm:ss}] {msg}", tag));
+        _log.Information($"[HMS] {msg}");
+        StateChanged?.Invoke();
+    }
+
+    public void Dispose() { }
+}

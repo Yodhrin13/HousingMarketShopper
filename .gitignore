@@ -1,0 +1,31 @@
+# Build outputs
+bin/
+obj/
+
+# Visual Studio / Rider
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.idea/
+
+# Rider
+*.DotSettings.user
+
+# NuGet
+*.nupkg
+*.snupkg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code session files
+.claude/
+
+# Plugin config cache (downloaded data, user-specific)
+# pluginConfigs/ lives in AppData, not in source — nothing to ignore here
+
+# Local publish output if any
+publish/

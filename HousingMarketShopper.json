@@ -1,0 +1,16 @@
+{
+  "Author": "HousingMarketShopper",
+  "Name": "HousingMarketShopper",
+  "Description": "Reads a furnishing list, finds the cheapest market listings across all worlds via Universalis, then automates navigation and purchase using Lifestream and vnavmesh.",
+  "Punchline": "Automatically source and buy housing furnishings at the best cross-world price.",
+  "InternalName": "HousingMarketShopper",
+  "AssemblyVersion": "1.0.0.0",
+  "RepoUrl": "https://github.com/example/HousingMarketShopper",
+  "Tags": ["housing", "furnishing", "market", "automation", "universalis"],
+  "DalamudApiLevel": 15,
+  "LoadRequiredState": 0,
+  "LoadSync": false,
+  "CanUnloadAsync": true,
+  "LoadPriority": 0,
+  "TestingOptIn": false
+}

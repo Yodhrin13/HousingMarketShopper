@@ -1,0 +1,16 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+
+  <PropertyGroup>
+    <RootNamespace>HousingMarketShopper</RootNamespace>
+    <AssemblyName>HousingMarketShopper</AssemblyName>
+    <Version>1.0.0</Version>
+    <!-- Required for the STA-thread Windows file-picker dialog in MainWindow. -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- CS8500: expected when declaring pointers to FFXIVClientStructs types that
+         contain Utf8String / CStringPointer fields. Safe to suppress — these structs
+         are designed for unsafe use. -->
+    <NoWarn>$(NoWarn);CS8500</NoWarn>
+  </PropertyGroup>
+
+
+</Project>
