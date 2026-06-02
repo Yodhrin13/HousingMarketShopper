@@ -49,7 +49,7 @@ jobs:
       - name: Verify build artifact
         shell: bash
         run: |
-          ZIP="bin/x64/Release/HousingMarketShopper/latest.zip"
+          ZIP="bin/Release/HousingMarketShopper/latest.zip"
           if [ ! -f "$ZIP" ]; then
             echo "ERROR: expected zip not found at $ZIP"
             echo "Zips found:"
@@ -68,7 +68,7 @@ jobs:
             echo "Release $TAG already exists — skipping."
           else
             gh release create "$TAG" \
-              bin/x64/Release/HousingMarketShopper/latest.zip \
+              bin/Release/HousingMarketShopper/latest.zip \
               --repo Yodhrin13/HousingMarketShopper \
               --title "$TAG" \
               --generate-notes
