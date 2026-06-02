@@ -346,15 +346,29 @@ public sealed class MarketboardService
         {
             await _framework.RunOnFrameworkThread(() => RunTextSearchUnsafe(itemName));
 
-            // Poll up to 10 s for the search results list to populate.
-            // Results can take several seconds on a slow server — 200 ms was too short.
+            // Poll for ~3.5 s. If still empty, the game may have dropped the search —
+            // re-fire RunSearch once and poll for up to 6 s more before giving up.
             int resultCount = 0;
-            for (var attempt = 0; attempt < 25 && resultCount == 0; attempt++)
+            for (var attempt = 0; attempt < 9 && resultCount == 0; attempt++)
             {
                 await Task.Delay(400, ct);
                 resultCount = await _framework.RunOnFrameworkThread(
                     () => GetItemSearchResultCountUnsafe());
             }
+
+            if (resultCount == 0)
+            {
+                _log.Information($"[HMS] No results after 3.5 s — re-running search for '{itemName}'.");
+                await _framework.RunOnFrameworkThread(() => RunTextSearchUnsafe(itemName));
+
+                for (var attempt = 0; attempt < 15 && resultCount == 0; attempt++)
+                {
+                    await Task.Delay(400, ct);
+                    resultCount = await _framework.RunOnFrameworkThread(
+                        () => GetItemSearchResultCountUnsafe());
+                }
+            }
+
             if (resultCount == 0)
                 throw new MarketboardStateException($"RunSearch returned no results for '{itemName}'.");
 
@@ -362,11 +376,32 @@ public sealed class MarketboardService
             // which opens ISR and sends the server listing request packet.
             await _framework.RunOnFrameworkThread(() => RequestItemListingsUnsafe(itemId));
 
-            // Wait for Dalamud's IMarketBoard.OfferingsReceived to fire (up to 10 s).
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
+            // Wait for IMarketBoard.OfferingsReceived. If no response within 5 s the
+            // server packet was likely dropped — re-dispatch and wait up to 10 s more.
+            IReadOnlyList<IMarketBoardItemListing>? received = null;
+            for (var pass = 0; pass < 2 && received == null; pass++)
+            {
+                if (pass == 1)
+                {
+                    _log.Information($"[HMS] No offerings response after 5 s — re-dispatching listing request for '{itemName}'.");
+                    _offeringsTcs = new TaskCompletionSource<IReadOnlyList<IMarketBoardItemListing>>(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    await _framework.RunOnFrameworkThread(() => RequestItemListingsUnsafe(itemId));
+                }
 
-            _lastOfferings = await _offeringsTcs.Task.WaitAsync(timeoutCts.Token);
+                try
+                {
+                    using var passTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    passTimeout.CancelAfter(TimeSpan.FromSeconds(pass == 0 ? 5 : 10));
+                    received = await _offeringsTcs.Task.WaitAsync(passTimeout.Token);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested) { /* retry */ }
+            }
+
+            if (received == null)
+                throw new MarketboardStateException($"No listing response received for '{itemName}' within timeout.");
+
+            _lastOfferings = received;
             _log.Debug($"[HMS] Offerings received for '{itemName}': {_lastOfferings.Count} listing(s).");
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
