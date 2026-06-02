@@ -3,8 +3,8 @@
     "Author": "Yodhrin13",
     "Name": "HousingMarketShopper",
     "InternalName": "HousingMarketShopper",
-    "AssemblyVersion": "1.0.0.0",
-    "TestingAssemblyVersion": "1.0.0.0",
+    "AssemblyVersion": "1.0.1.0",
+    "TestingAssemblyVersion": "1.0.1.0",
     "Punchline": "Automatically source and buy housing furnishings at the best cross-world price.",
     "Description": "Reads a MakePlace furnishing list, finds the cheapest market listings across all worlds via Universalis, then automates world-hopping and purchasing via Lifestream.",
     "Tags": [
@@ -22,7 +22,7 @@
     "DownloadLinkInstall": "https://github.com/Yodhrin13/HousingMarketShopper/releases/latest/download/latest.zip",
     "DownloadLinkTesting": "https://github.com/Yodhrin13/HousingMarketShopper/releases/latest/download/latest.zip",
     "DownloadLinkUpdate": "https://github.com/Yodhrin13/HousingMarketShopper/releases/latest/download/latest.zip",
-    "LastUpdated": 1780365878,
+    "LastUpdated": 1780366776,
     "DownloadCount": 0
   }
 ]
