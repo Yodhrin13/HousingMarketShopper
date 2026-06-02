@@ -1,66 +1,92 @@
-name: Build and Release
+name: Release
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
+    branches:
+      - main
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  release:
     runs-on: windows-latest
-    permissions:
-      contents: write
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup .NET
+      - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.x'
 
-      - name: Restore
-        run: dotnet restore
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: nuget-
+
+      - name: Extract version
+        id: version
+        shell: bash
+        run: |
+          ASSEMBLY=$(python -c "import json; print(json.load(open('HousingMarketShopper.json'))['AssemblyVersion'])")
+          echo "assembly=$ASSEMBLY" >> $GITHUB_OUTPUT
+          TAG="v$(echo $ASSEMBLY | sed 's/\.0$//')"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Version: $ASSEMBLY  Tag: $TAG"
+
+      - name: Download Dalamud
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://goatcorp.github.io/dalamud-distrib/latest.zip -OutFile dalamud.zip
+          Expand-Archive -Path dalamud.zip -DestinationPath "$env:AppData\XIVLauncher\addon\Hooks\dev"
 
       - name: Build
-        run: dotnet build --configuration Release --no-restore
+        run: dotnet build --configuration Release --nologo
 
-      - name: Get version
-        id: version
-        shell: pwsh
+      - name: Verify build artifact
+        shell: bash
         run: |
-          $json = Get-Content "HousingMarketShopper.json" | ConvertFrom-Json
-          echo "version=$($json.AssemblyVersion)" >> $env:GITHUB_OUTPUT
+          ZIP="bin/x64/Release/HousingMarketShopper/latest.zip"
+          if [ ! -f "$ZIP" ]; then
+            echo "ERROR: expected zip not found at $ZIP"
+            echo "Zips found:"
+            find bin -name "*.zip" 2>/dev/null
+            exit 1
+          fi
+          echo "Found: $ZIP"
 
-      - name: Package
-        shell: pwsh
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $out = "bin/Release/net10.0-windows"
-          Compress-Archive `
-            -Path "$out/HousingMarketShopper.dll", "HousingMarketShopper.json" `
-            -DestinationPath "latest.zip"
-
-      - name: Create/update release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: "Latest Build"
-          files: latest.zip
-          body: "Automated build — v${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          if gh release view "$TAG" --repo Yodhrin13/HousingMarketShopper > /dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping."
+          else
+            gh release create "$TAG" \
+              bin/x64/Release/HousingMarketShopper/latest.zip \
+              --repo Yodhrin13/HousingMarketShopper \
+              --title "$TAG" \
+              --generate-notes
+          fi
 
       - name: Update pluginmaster.json
-        shell: pwsh
+        shell: bash
         run: |
-          $pm = Get-Content "pluginmaster.json" | ConvertFrom-Json
-          $pm[0].AssemblyVersion        = "${{ steps.version.outputs.version }}"
-          $pm[0].TestingAssemblyVersion = "${{ steps.version.outputs.version }}"
-          $pm[0].LastUpdated = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-          $pm | ConvertTo-Json -Depth 10 | Out-File "pluginmaster.json" -Encoding utf8NoBOM
+          VERSION="${{ steps.version.outputs.assembly }}"
+          TIMESTAMP=$(date +%s)
+          jq --arg v "$VERSION" --argjson t "$TIMESTAMP" \
+            '.[0].AssemblyVersion = $v | .[0].TestingAssemblyVersion = $v | .[0].LastUpdated = $t' \
+            pluginmaster.json > updated.json && mv updated.json pluginmaster.json
 
       - name: Commit pluginmaster.json
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add pluginmaster.json
-          git diff --staged --quiet || git commit -m "ci: update pluginmaster.json [skip ci]"
+          git diff --staged --quiet || git commit -m "ci: bump pluginmaster.json to ${{ steps.version.outputs.tag }} [skip ci]"
           git push
