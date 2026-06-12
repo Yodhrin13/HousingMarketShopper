@@ -49,6 +49,11 @@ public sealed class NavigationService : IDisposable
 
     public bool IpcReady => _lifestreamIsBusy != null;
 
+    /// <summary>Gil actually spent during the current/last run.</summary>
+    public int TotalActualSpend    { get; private set; }
+    /// <summary>Estimated total cost of the plan at run start.</summary>
+    public int TotalEstimatedSpend { get; private set; }
+
     /// <summary>
     /// Items that were not fully purchased during the last shopping session.
     /// Populated once the loop finishes (or is aborted/errored).
@@ -92,8 +97,10 @@ public sealed class NavigationService : IDisposable
         Func<ShoppingItem, Task<bool>> confirmHighValue,
         CancellationToken ct = default)
     {
-        IsRunning = true;
-        IsPaused  = false;
+        IsRunning           = true;
+        IsPaused            = false;
+        TotalActualSpend    = 0;
+        TotalEstimatedSpend = plan.TotalEstimatedCost;
         MissedItems.Clear();
         StateChanged?.Invoke();
 
@@ -395,6 +402,7 @@ public sealed class NavigationService : IDisposable
 
         item.QuantityPurchased = result.QuantityPurchased;
         item.ActualSpend       = result.TotalSpent;
+        TotalActualSpend      += result.TotalSpent;
         item.Status = result.Outcome switch
         {
             PurchaseOutcome.Success      => PurchaseStatus.Purchased,
@@ -596,11 +604,12 @@ public sealed class NavigationService : IDisposable
             var meta = itemMeta[itemId];
             MissedItems.Add(new ShoppingItem
             {
-                ItemId         = meta.ItemId,
-                Name           = meta.Name,
-                DyeName        = meta.DyeName,
-                QuantityNeeded = needed - purchased,
-                ResolveQuality = meta.ResolveQuality,
+                ItemId            = meta.ItemId,
+                Name              = meta.Name,
+                DyeName           = meta.DyeName,
+                QuantityNeeded    = needed - purchased,
+                ResolveQuality    = meta.ResolveQuality,
+                AvailableListings = meta.AvailableListings,
             });
         }
 

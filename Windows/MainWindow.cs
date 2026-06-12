@@ -198,8 +198,13 @@ public sealed class MainWindow : Window, IDisposable
             return;
         }
 
-        ImGui.TextUnformatted($"Plan: {plan.TotalItemCount} purchases  |  " +
-                               $"~{plan.TotalEstimatedCost:N0} gil total");
+        var dcCount    = plan.Groups.Count;
+        var worldCount = plan.Groups.Sum(g => g.Worlds.Count);
+        ImGui.TextUnformatted(
+            $"Plan: {plan.TotalItemCount} purchases  |  " +
+            $"{worldCount} world{(worldCount != 1 ? "s" : "")} across " +
+            $"{dcCount} DC{(dcCount != 1 ? "s" : "")}  |  " +
+            $"~{plan.TotalEstimatedCost:N0} gil total");
         ImGui.Spacing();
 
         // IPC availability warning
@@ -215,7 +220,7 @@ public sealed class MainWindow : Window, IDisposable
         var canShop = _nav.IpcReady && !_nav.IsRunning && plan.TotalItemCount > 0;
         if (!canShop) ImGui.BeginDisabled();
         if (ImGui.Button("Start Shopping"))
-            StartShopping(plan);
+            StartShopping(plan!);
         if (!canShop) ImGui.EndDisabled();
 
         ImGui.Spacing();
@@ -252,21 +257,45 @@ public sealed class MainWindow : Window, IDisposable
                     ImGui.TableSetupColumn("Total",     ImGuiTableColumnFlags.WidthFixed,  90f);
                     ImGui.TableHeadersRow();
 
+                    var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
                     foreach (var item in world.Items)
                     {
                         ImGui.TableNextRow();
                         ImGui.TableSetColumnIndex(0);
 
-                        // Highlight high-value items
                         var isHigh = item.IsHighValue;
-                        if (isHigh)
-                            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.55f, 0.1f, 1f));
+                        var bestListing = item.AvailableListings
+                            .Where(l => l.WorldName.Equals(world.WorldName,
+                                StringComparison.OrdinalIgnoreCase))
+                            .OrderBy(l => l.PricePerUnit)
+                            .FirstOrDefault();
+                        var ageHours  = bestListing != null && bestListing.LastReviewTime > 0
+                            ? (nowUnix - bestListing.LastReviewTime) / 3600.0
+                            : 0;
+                        var isStale = ageHours > 24;
 
-                        var name = item.DyeName != null
-                            ? $"{(isHigh ? "⚠ " : "")}{item.Name} ({item.DyeName})"
-                            : $"{(isHigh ? "⚠ " : "")}{item.Name}";
+                        var textColor = isStale  ? new Vector4(1f, 0.75f, 0.2f, 1f)   // amber — stale
+                                      : isHigh   ? new Vector4(1f, 0.55f, 0.1f, 1f)   // orange — high value
+                                      :            Vector4.One;
+                        ImGui.PushStyleColor(ImGuiCol.Text, textColor);
+
+                        var prefix = (isStale ? "⏱ " : "") + (isHigh ? "⚠ " : "");
+                        var name   = item.DyeName != null
+                            ? $"{prefix}{item.Name} ({item.DyeName})"
+                            : $"{prefix}{item.Name}";
                         ImGui.TextUnformatted(name);
-                        if (isHigh) ImGui.PopStyleColor();
+                        ImGui.PopStyleColor();
+
+                        if (ImGui.IsItemHovered())
+                        {
+                            if (isStale && isHigh)
+                                ImGui.SetTooltip($"High value  |  Listing {ageHours:F0}h old — price may be stale");
+                            else if (isStale)
+                                ImGui.SetTooltip($"Listing {ageHours:F0}h old — price may be stale");
+                            else if (isHigh)
+                                ImGui.SetTooltip("High value — will require confirmation");
+                        }
 
                         ImGui.TableSetColumnIndex(1);
                         ImGui.TextUnformatted(item.QuantityNeeded.ToString());
@@ -316,6 +345,21 @@ public sealed class MainWindow : Window, IDisposable
         }
 
         ImGui.TextUnformatted($"Status: {(_nav.IsRunning ? (_nav.IsPaused ? "Paused" : "Running") : "Done")}");
+
+        // Gil spend line
+        if (_nav.IsRunning)
+        {
+            ImGui.SameLine(160f);
+            ImGui.TextUnformatted($"Spent: {_nav.TotalActualSpend:N0}  /  ~{_nav.TotalEstimatedSpend:N0} gil");
+        }
+        else if (_nav.TotalActualSpend > 0)
+        {
+            ImGui.SameLine(160f);
+            var diff    = _nav.TotalActualSpend - _nav.TotalEstimatedSpend;
+            var diffStr = diff >= 0 ? $"+{diff:N0}" : $"{diff:N0}";
+            ImGui.TextUnformatted($"Final: {_nav.TotalActualSpend:N0} gil  ({diffStr} vs estimate)");
+        }
+
         ImGui.Spacing();
 
         // ── Inventory pause banner ─────────────────────────────────────────────
@@ -401,6 +445,18 @@ public sealed class MainWindow : Window, IDisposable
                 ImGui.SetClipboardText(string.Join("\n", lines));
             }
 
+            ImGui.SameLine();
+            var canRetry = _nav.IpcReady && !_nav.IsRunning;
+            if (!canRetry) ImGui.BeginDisabled();
+            if (ImGui.Button("Retry Missed Items"))
+            {
+                var retryItems = _nav.MissedItems.ToList();
+                var retryPlan  = _shopList.BuildRetryPlan(retryItems, GetPlayerWorldName());
+                if (retryPlan.TotalItemCount > 0)
+                    StartShopping(retryPlan);
+            }
+            if (!canRetry) ImGui.EndDisabled();
+
             ImGui.Spacing();
             ImGui.Separator();
             ImGui.Spacing();
@@ -477,7 +533,6 @@ public sealed class MainWindow : Window, IDisposable
         _shopCts?.Dispose();
         _shopCts = new CancellationTokenSource();
         var ct   = _shopCts.Token;
-
         _ = _nav.RunShoppingLoopAsync(plan, GetPlayerDcName(), GetPlayerWorldName(),
             async item => await Plugin.ConfirmWindow.ShowAsync(item), ct);
     }

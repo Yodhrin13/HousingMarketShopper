@@ -75,6 +75,20 @@ public sealed class ConfigWindow : Window
         }
 
         ImGui.Spacing();
+        ImGui.TextUnformatted("Plan Optimisation");
+        ImGui.Separator();
+        ImGui.TextDisabled("Consolidates items onto fewer worlds to reduce travel.");
+        ImGui.Spacing();
+
+        var consolidation = cfg.WorldConsolidationTolerance;
+        if (ImGui.SliderInt("World consolidation tolerance (%)", ref consolidation, 0, 30))
+            cfg.WorldConsolidationTolerance = consolidation;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(
+                "Items are moved to a world already in the plan when its price is within\n" +
+                "this % of the cheapest. 0 = always buy at the absolute cheapest world.");
+
+        ImGui.Spacing();
         ImGui.TextUnformatted("Navigation");
         ImGui.Separator();
 

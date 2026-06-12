@@ -35,6 +35,13 @@ public class Configuration : IPluginConfiguration
     public int  InventoryEmergencyThreshold { get; set; } = 3;
     public bool AutoInventoryPause      { get; set; } = true;
 
+    // ── Plan optimisation ─────────────────────────────────────────────────────
+    /// <summary>
+    /// Items are reassigned to a world already in the plan when the price there
+    /// is within this percentage of the cheapest world. 0 disables consolidation.
+    /// </summary>
+    public int WorldConsolidationTolerance { get; set; } = 10;
+
     // ── UI state ──────────────────────────────────────────────────────────────
     public string LastImportPath { get; set; } = string.Empty;
 

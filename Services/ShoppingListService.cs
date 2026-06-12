@@ -164,10 +164,32 @@ public sealed class ShoppingListService
     private ShoppingPlan BuildPlan(List<ShoppingItem> resolvedItems, string? playerWorld)
     {
         var plan = new ShoppingPlan();
-
-        // Excluded items are omitted from the plan entirely.
         foreach (var item in LoadedItems.Where(i => !i.IsResolved && !i.Excluded))
             plan.Unresolved.Add(item);
+        return BuildPlanItems(plan, resolvedItems, playerWorld);
+    }
+
+    /// <summary>
+    /// Rebuilds a shopping plan from a set of previously-missed items, reusing
+    /// their existing Universalis listings without a network fetch.
+    /// </summary>
+    public ShoppingPlan BuildRetryPlan(List<ShoppingItem> missedItems, string? playerWorld)
+    {
+        foreach (var item in missedItems)
+        {
+            item.Status            = PurchaseStatus.Pending;
+            item.QuantityPurchased = 0;
+            item.ActualSpend       = 0;
+            item.PurchaseConfirmed = false;
+            item.Excluded          = false;
+        }
+        var plan    = BuildPlanItems(new ShoppingPlan(), missedItems, playerWorld);
+        CurrentPlan = plan;
+        return plan;
+    }
+
+    private ShoppingPlan BuildPlanItems(ShoppingPlan plan, List<ShoppingItem> resolvedItems, string? playerWorld)
+    {
 
         // For each resolved, non-excluded item, find the best source world
         var worldGroups = new Dictionary<string, (string dc, List<ShoppingItem> items)>(
@@ -219,6 +241,59 @@ public sealed class ShoppingListService
             if (!worldGroups.ContainsKey(key))
                 worldGroups[key] = (dc, []);
             worldGroups[key].items.Add(item);
+        }
+
+        // ── Consolidation pass ─────────────────────────────────────────────────
+        // Reassign items to an already-planned world when the price difference is
+        // within the configured tolerance, reducing the number of world hops.
+        if (_cfg.WorldConsolidationTolerance > 0)
+        {
+            var tolerance = _cfg.WorldConsolidationTolerance / 100.0;
+            bool changed;
+            do
+            {
+                changed = false;
+                foreach (var srcWorld in worldGroups.Keys.ToList())
+                {
+                    if (!worldGroups.TryGetValue(srcWorld, out var srcEntry)) continue;
+
+                    foreach (var item in srcEntry.items.ToList())
+                    {
+                        var maxAcceptableTotal = (int)(item.TotalPrice * (1 + tolerance));
+                        string? bestTarget = null;
+                        int     bestCount  = srcEntry.items.Count;
+
+                        foreach (var (tgtWorld, (_, tgtItems)) in worldGroups)
+                        {
+                            if (tgtWorld.Equals(srcWorld, StringComparison.OrdinalIgnoreCase)) continue;
+                            if (tgtItems.Count <= bestCount) continue;
+
+                            var cost = CalcWorldCost(item, tgtWorld);
+                            if (cost == null || cost.Value.total > maxAcceptableTotal) continue;
+
+                            bestTarget = tgtWorld;
+                            bestCount  = tgtItems.Count;
+                        }
+
+                        if (bestTarget != null)
+                        {
+                            var cost = CalcWorldCost(item, bestTarget)!.Value;
+                            srcEntry.items.Remove(item);
+                            item.PricePerUnit = cost.ppu;
+                            item.TotalPrice   = cost.total;
+                            item.IsHighValue  = item.PricePerUnit > _cfg.MaxPriceAutoApprove;
+                            worldGroups[bestTarget].items.Add(item);
+
+                            if (srcEntry.items.Count == 0)
+                                worldGroups.Remove(srcWorld);
+
+                            changed = true;
+                            break;
+                        }
+                    }
+                    if (changed) break;
+                }
+            } while (changed);
         }
 
         // Group into DC → World hierarchy
@@ -284,6 +359,33 @@ public sealed class ShoppingListService
         }
 
         return dcs;
+    }
+
+    private (int ppu, int total)? CalcWorldCost(ShoppingItem item, string worldName)
+    {
+        var listings = item.AvailableListings
+            .Where(l => l.WorldName.Equals(worldName, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (listings.Count == 0) return null;
+
+        var candidates = _cfg.PreferNQ ? listings.Where(l => !l.IsHQ).ToList() : listings;
+        if (candidates.Count == 0) candidates = listings;
+
+        var sorted    = candidates.OrderBy(l => l.PricePerUnit).ToList();
+        var remaining = item.QuantityNeeded;
+        var total     = 0;
+        var worstPpu  = 0;
+
+        foreach (var l in sorted)
+        {
+            if (remaining <= 0) break;
+            var take  = Math.Min(remaining, l.Quantity);
+            total    += take * l.PricePerUnit;
+            worstPpu  = l.PricePerUnit;
+            remaining -= take;
+        }
+
+        return remaining > 0 ? null : (worstPpu, total);
     }
 
     private string FindDCForWorld(string worldName)

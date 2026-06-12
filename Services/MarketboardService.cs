@@ -417,6 +417,53 @@ public sealed class MarketboardService
         }
     }
 
+    /// <summary>
+    /// Re-requests the listing packet for an already-selected item without
+    /// re-running the text search. Used between purchases of the same item.
+    /// </summary>
+    private async Task RefreshListingsAsync(uint itemId, string itemName, CancellationToken ct)
+    {
+        _offeringsItemId = itemId;
+        _offeringsTcs    = new TaskCompletionSource<IReadOnlyList<IMarketBoardItemListing>>(
+                               TaskCreationOptions.RunContinuationsAsynchronously);
+
+        try
+        {
+            await _framework.RunOnFrameworkThread(() => RequestItemListingsUnsafe(itemId));
+
+            IReadOnlyList<IMarketBoardItemListing>? received = null;
+            for (var pass = 0; pass < 2 && received == null; pass++)
+            {
+                if (pass == 1)
+                {
+                    _log.Information($"[HMS] No refresh response after 5 s — re-dispatching for '{itemName}'.");
+                    _offeringsTcs = new TaskCompletionSource<IReadOnlyList<IMarketBoardItemListing>>(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    await _framework.RunOnFrameworkThread(() => RequestItemListingsUnsafe(itemId));
+                }
+
+                try
+                {
+                    using var passTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    passTimeout.CancelAfter(TimeSpan.FromSeconds(pass == 0 ? 5 : 10));
+                    received = await _offeringsTcs.Task.WaitAsync(passTimeout.Token);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
+            }
+
+            if (received == null)
+                throw new MarketboardStateException($"No refresh response for '{itemName}' within timeout.");
+
+            _lastOfferings = received;
+            _log.Debug($"[HMS] Listings refreshed for '{itemName}': {_lastOfferings.Count} listing(s).");
+        }
+        finally
+        {
+            _offeringsTcs    = null;
+            _offeringsItemId = 0;
+        }
+    }
+
     private unsafe void RunTextSearchUnsafe(string itemName)
     {
         var baseAddon = AddonWaiter.GetVisibleAddon(_gameGui, AddonItemSearch);
@@ -510,9 +557,11 @@ public sealed class MarketboardService
         await Task.Delay(Math.Max(_config.NavigationDelayMs, 2_000), ct);
 
         // Re-request listings so the next loop iteration has fresh data.
+        // We only need to re-dispatch the listing request — RunSearch is not
+        // needed again because the item is already selected in the results list.
         try
         {
-            await SearchForItemAsync(itemId, itemName, ct);
+            await RefreshListingsAsync(itemId, itemName, ct);
         }
         catch (MarketboardStateException)
         {
