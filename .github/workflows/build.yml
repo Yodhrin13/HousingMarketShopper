@@ -79,8 +79,9 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.assembly }}"
           TIMESTAMP=$(date +%s)
-          jq --arg v "$VERSION" --argjson t "$TIMESTAMP" \
-            '.[0].AssemblyVersion = $v | .[0].TestingAssemblyVersion = $v | .[0].LastUpdated = $t' \
+          CHANGELOG=$(python -c "import json; d=json.load(open('HousingMarketShopper.json')); print(d.get('Changelog',''))")
+          jq --arg v "$VERSION" --argjson t "$TIMESTAMP" --arg cl "$CHANGELOG" \
+            '.[0].AssemblyVersion = $v | .[0].TestingAssemblyVersion = $v | .[0].LastUpdated = $t | .[0].Changelog = (if $cl == "" then null else $cl end)' \
             pluginmaster.json > updated.json && mv updated.json pluginmaster.json
 
       - name: Commit pluginmaster.json
