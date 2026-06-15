@@ -22,7 +22,7 @@
     "DownloadLinkInstall": "https://github.com/Yodhrin13/HousingMarketShopper/releases/latest/download/latest.zip",
     "DownloadLinkTesting": "https://github.com/Yodhrin13/HousingMarketShopper/releases/latest/download/latest.zip",
     "DownloadLinkUpdate": "https://github.com/Yodhrin13/HousingMarketShopper/releases/latest/download/latest.zip",
-    "LastUpdated": 1781557991,
+    "LastUpdated": 1781558364,
     "Changelog": "1.0.3\r\n- New: manual + persistent item resolution — Fix unresolved/fuzzy items via a searchable picker; corrections are remembered across imports\r\n- New: save, load, and delete named shopping lists\r\n- New: resume an interrupted run after a crash or logout (progress saved to disk)\r\n- New: dry-run mode logs the full route and intended purchases without buying\r\n- New: budget cap drops the most expensive items to keep a plan under a gil ceiling\r\n- New: gil-on-hand check warns when a plan exceeds your current gil\r\n- New: per-item world-price comparison popup and an Open on Universalis link\r\n- New: plan sort/filter, consolidation savings, and a rough travel-time estimate\r\n- New: confirm dialog shows the expected source world and listings/retainers\r\n- New: configurable price-premium tolerance and stale-listing threshold\r\n- New: inline quantity editing and resolution confidence in the Import tab",
     "DownloadCount": 0
   }
