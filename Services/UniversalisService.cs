@@ -111,20 +111,6 @@ public sealed class UniversalisService : IDisposable
         return result;
     }
 
-    // ── Progress-reporting variant used by ShoppingListService ────────────────
-
-    public async Task FetchListingsForPlanAsync(
-        Dictionary<string, List<int>>   dcItemMap, // DC name → item IDs needed
-        bool                            preferNq,
-        IProgress<(int done, int total)>? progress,
-        CancellationToken               ct = default)
-    {
-        // This method intentionally returns nothing — callers merge results via
-        // the returned Task<Dictionary<int,List<MarketListing>>>.
-        // Use FetchListingsAsync per datacenter instead (see ShoppingListService).
-        await Task.CompletedTask;
-    }
-
     // ── Parsing ───────────────────────────────────────────────────────────────
 
     private List<MarketListing>? ParseSingle(string json)

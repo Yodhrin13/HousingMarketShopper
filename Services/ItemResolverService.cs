@@ -29,12 +29,39 @@ public sealed class ItemResolverService : IDisposable
     private readonly IPluginLog  _log;
     private readonly string      _cacheDir;
 
-    // item name (lower) → item ID
-    private Dictionary<string, int> _itemMap = [];
+    // item name (lower) → item ID, and the reverse id → proper-case name
+    private Dictionary<string, int> _itemMap   = [];
+    private Dictionary<int, string> _itemNames = [];
     private Dictionary<int, WorldInfo> _worldMap = [];
 
     public bool IsItemDataLoaded => _itemMap.Count > 0;
     public bool IsWorldDataLoaded => _worldMap.Count > 0;
+
+    /// <summary>Canonical (proper-case) display name for an item ID, if known.</summary>
+    public string? GetItemName(int id) => _itemNames.GetValueOrDefault(id);
+
+    /// <summary>
+    /// All known item names as (id, name) pairs, for manual-resolution search.
+    /// </summary>
+    public IReadOnlyDictionary<int, string> ItemNames => _itemNames;
+
+    /// <summary>User-pinned name→id overrides, consulted before fuzzy matching.</summary>
+    public Dictionary<string, int> Overrides { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Case-insensitive substring search over item names, shortest first.</summary>
+    public List<(int id, string name)> SearchItems(string query, int limit = 100)
+    {
+        if (string.IsNullOrWhiteSpace(query)) return [];
+        var q = query.Trim();
+        return _itemNames
+            .Where(kv => kv.Value.Contains(q, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(kv => kv.Value.Length)
+            .ThenBy(kv => kv.Value, StringComparer.OrdinalIgnoreCase)
+            .Take(limit)
+            .Select(kv => (kv.Key, kv.Value))
+            .ToList();
+    }
 
     // ── Section header patterns to skip ──────────────────────────────────────
     private static readonly string[] SectionKeywords =
@@ -404,11 +431,22 @@ public sealed class ItemResolverService : IDisposable
 
         var lower = item.Name.ToLowerInvariant().Trim();
 
+        // User-pinned override takes precedence over everything.
+        if (Overrides.TryGetValue(lower, out var ovId))
+        {
+            item.ItemId           = ovId;
+            item.ResolveQuality   = ResolveQuality.Exact;
+            item.ResolvedItemName = _itemNames.GetValueOrDefault(ovId);
+            item.IsManualOverride = true;
+            return;
+        }
+
         // Exact match
         if (_itemMap.TryGetValue(lower, out var id))
         {
-            item.ItemId         = id;
-            item.ResolveQuality = ResolveQuality.Exact;
+            item.ItemId           = id;
+            item.ResolveQuality   = ResolveQuality.Exact;
+            item.ResolvedItemName = _itemNames.GetValueOrDefault(id);
             return;
         }
 
@@ -433,9 +471,11 @@ public sealed class ItemResolverService : IDisposable
         var threshold = Math.Max(3, (int)(lower.Length * 0.15));
         if (best <= threshold)
         {
-            item.ItemId         = bestId;
-            item.ResolveQuality = ResolveQuality.FuzzyMatch;
-            item.ResolveWarning = $"Fuzzy match: '{item.Name}' → '{bestKey}' (dist {best})";
+            item.ItemId           = bestId;
+            item.ResolveQuality   = ResolveQuality.FuzzyMatch;
+            item.ResolvedItemName = _itemNames.GetValueOrDefault(bestId) ?? bestKey;
+            item.FuzzyDistance    = best;
+            item.ResolveWarning   = $"Fuzzy match: '{item.Name}' → '{item.ResolvedItemName}' (dist {best})";
             _log.Warning($"[HMS] Fuzzy matched '{item.Name}' → '{bestKey}' (id {bestId})");
             return;
         }
@@ -458,14 +498,16 @@ public sealed class ItemResolverService : IDisposable
         await Task.WhenAll(xivapiTask, teamcraftTask);
 
         var merged = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var names  = new Dictionary<int, string>();
 
         if (xivapiTask.Result is { } xivapiText)
-            ParseXivapiCsv(xivapiText, merged);
+            ParseXivapiCsv(xivapiText, merged, names);
 
         if (teamcraftTask.Result is { } tcText)
-            ParseTeamcraftJson(tcText, merged);
+            ParseTeamcraftJson(tcText, merged, names);
 
-        _itemMap = merged;
+        _itemMap   = merged;
+        _itemNames = names;
         _log.Information($"[HMS] Item map loaded: {_itemMap.Count} entries");
     }
 
@@ -523,7 +565,8 @@ public sealed class ItemResolverService : IDisposable
 
     // ── CSV / JSON parsers ────────────────────────────────────────────────────
 
-    private static void ParseXivapiCsv(string csv, Dictionary<string, int> map)
+    private static void ParseXivapiCsv(
+        string csv, Dictionary<string, int> map, Dictionary<int, string> names)
     {
         // Row 0 = column headers, Row 1 = type row, rows 2+ = data
         // Columns: #,Name,Description,...  (column 0 = ID, column 1 = Name)
@@ -540,10 +583,12 @@ public sealed class ItemResolverService : IDisposable
             var name = parts[1].Trim('"', ' ');
             if (string.IsNullOrWhiteSpace(name)) continue;
             map.TryAdd(name.ToLowerInvariant(), id);
+            names.TryAdd(id, name);
         }
     }
 
-    private static void ParseTeamcraftJson(string json, Dictionary<string, int> map)
+    private static void ParseTeamcraftJson(
+        string json, Dictionary<string, int> map, Dictionary<int, string> names)
     {
         // { "12345": { "en": "Item Name", "de": "...", ... }, ... }
         using var doc = JsonDocument.Parse(json);
@@ -554,6 +599,7 @@ public sealed class ItemResolverService : IDisposable
             var name = enProp.GetString();
             if (string.IsNullOrWhiteSpace(name)) continue;
             map.TryAdd(name.ToLowerInvariant(), id);
+            names.TryAdd(id, name);
         }
     }
 

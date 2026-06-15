@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Dalamud.Plugin;
@@ -61,7 +63,42 @@ public sealed class NavigationService : IDisposable
     /// </summary>
     public List<ShoppingItem> MissedItems { get; } = [];
 
+    // ── Cross-session resume ──────────────────────────────────────────────────
+    private readonly string _runStatePath;
+    private bool            _hasSavedRun;
+    private ShoppingPlan?       _activePlan;
+    private List<ShoppingItem>  _activeOverflow = [];
+    private string?         _runPlayerDc;
+    private string?         _runPlayerWorld;
+
+    private static readonly JsonSerializerOptions RunJsonOpts = new() { WriteIndented = false };
+
+    /// <summary>True when an interrupted run snapshot exists on disk.</summary>
+    public bool    HasSavedRun  => _hasSavedRun;
+    /// <summary>Human-readable summary of the saved run, for the resume banner.</summary>
+    public string? SavedRunInfo { get; private set; }
+
     public event Action? StateChanged;
+
+    private sealed class RunStateDto
+    {
+        public string?           PlayerDc    { get; set; }
+        public string?           PlayerWorld { get; set; }
+        public DateTime          SavedAt     { get; set; }
+        public List<RunItemDto>  Items       { get; set; } = [];
+    }
+
+    private sealed class RunItemDto
+    {
+        public int                 ItemId            { get; set; }
+        public string              Name              { get; set; } = "";
+        public string?             DyeName           { get; set; }
+        public int                 QuantityRemaining { get; set; }
+        public int                 PricePerUnit      { get; set; }
+        public bool                IsHighValue       { get; set; }
+        public ResolveQuality      ResolveQuality    { get; set; }
+        public List<MarketListing> AvailableListings { get; set; } = [];
+    }
 
     public NavigationService(
         IDalamudPluginInterface pi,
@@ -80,6 +117,9 @@ public sealed class NavigationService : IDisposable
         _clientState = clientState;
         _cfg         = cfg;
         _log         = log;
+        _runStatePath = Path.Combine(pi.GetPluginConfigDirectory(), "runstate.json");
+
+        ProbeSavedRun();
 
         try
         {
@@ -107,6 +147,13 @@ public sealed class NavigationService : IDisposable
         // Tracks every overflow (re-routed) ShoppingItem created during the run
         // so we can compute per-item purchased totals for the end-of-run summary.
         var allOverflowItems = new List<ShoppingItem>();
+
+        // Wire run-state persistence so a crash/logout can be resumed next session.
+        _activePlan     = plan;
+        _activeOverflow = allOverflowItems;
+        _runPlayerDc    = currentDcName;
+        _runPlayerWorld = currentWorldName;
+        SaveRunState();
 
         try
         {
@@ -233,6 +280,11 @@ public sealed class NavigationService : IDisposable
         finally
         {
             BuildMissedItemsSummary(plan, allOverflowItems);
+            // Run finished (completed or user-aborted) — discard the resume snapshot.
+            // Only a hard crash/logout leaves it on disk for next session.
+            ClearRunState();
+            _activePlan     = null;
+            _activeOverflow = [];
             IsRunning = false;
             StateChanged?.Invoke();
         }
@@ -274,6 +326,9 @@ public sealed class NavigationService : IDisposable
 
             await PurchaseItemAsync(item, ct);
 
+            // Persist progress after every item so a crash loses at most one purchase.
+            SaveRunState();
+
             // Re-route if partially purchased OR not listed at all on this world.
             var needsReroute = item.Status == PurchaseStatus.Partial
                             || item.Status == PurchaseStatus.NotListed;
@@ -303,6 +358,7 @@ public sealed class NavigationService : IDisposable
                         PurchaseConfirmed = item.PurchaseConfirmed,
                         AvailableListings = item.AvailableListings,
                         ResolveQuality    = item.ResolveQuality,
+                        SourceWorld       = altWorld,
                     };
                     if (!fallbackQueue.ContainsKey(altWorld)) fallbackQueue[altWorld] = [];
                     fallbackQueue[altWorld].Add(overflow);
@@ -324,6 +380,48 @@ public sealed class NavigationService : IDisposable
             .OrderBy(l => l.PricePerUnit)
             .FirstOrDefault()
             ?.WorldName;
+    }
+
+    /// <summary>
+    /// Walks the plan and logs every intended teleport and purchase without travelling
+    /// or buying anything — lets the user validate the route and prices first.
+    /// </summary>
+    public void SimulateRun(ShoppingPlan plan)
+    {
+        Log.Clear();
+        LogAction("── Dry run — no teleport, no purchases ──", LogTag.Info);
+
+        var totalGil   = 0;
+        var worldCount = 0;
+        foreach (var dc in plan.Groups)
+        {
+            LogAction($"DC: {dc.DataCenterName}", LogTag.Navigation);
+            foreach (var w in dc.Worlds)
+            {
+                worldCount++;
+                LogAction(
+                    $"  → {w.WorldName}  ({w.Items.Count} items, ~{w.TotalEstimatedCost:N0} gil)",
+                    LogTag.Navigation);
+                foreach (var item in w.Items.OrderByDescending(i => i.TotalPrice))
+                {
+                    var tag = item.IsHighValue ? LogTag.Warning : LogTag.Purchase;
+                    LogAction(
+                        $"      buy {item.QuantityNeeded}× {item.Name} @ {item.PricePerUnit:N0} " +
+                        $"= {item.TotalPrice:N0}{(item.IsHighValue ? "  (high value — would prompt)" : "")}",
+                        tag);
+                    totalGil += item.TotalPrice;
+                }
+            }
+        }
+
+        if (plan.Unresolved.Count > 0)
+            LogAction($"  {plan.Unresolved.Count} unresolved item(s) skipped.", LogTag.Error);
+        if (plan.NotListed.Count > 0)
+            LogAction($"  {plan.NotListed.Count} not-listed item(s) skipped.", LogTag.Warning);
+
+        LogAction(
+            $"── Dry run complete: {plan.TotalItemCount} items across {worldCount} world(s), " +
+            $"~{totalGil:N0} gil ──", LogTag.Success);
     }
 
     public void Pause()  { IsPaused = true;  StateChanged?.Invoke(); }
@@ -389,12 +487,12 @@ public sealed class NavigationService : IDisposable
     {
         LogAction($"Purchasing {item.QuantityNeeded}× {item.Name} @ {item.PricePerUnit:N0} gil…", LogTag.Purchase);
 
-        // For high-value confirmed items apply the same 20% price-drift tolerance that
+        // For high-value confirmed items apply the same price-drift tolerance that
         // MarketboardService.InitiatePurchaseUnsafe allows, so listings slightly above the
         // Universalis snapshot pass the candidate filter and are not incorrectly rejected.
         // For auto-approve items MaxPriceAutoApprove is the user's hard budget ceiling.
         var maxPpu = item.IsHighValue
-            ? (int)(item.PricePerUnit * 1.20f)
+            ? (int)(item.PricePerUnit * (1f + _cfg.MaxPricePremiumPercent / 100f))
             : _cfg.MaxPriceAutoApprove;
 
         var result = await _mb.PurchaseItemQuantityAsync(
@@ -531,6 +629,17 @@ public sealed class NavigationService : IDisposable
         catch { return 999; }
     }
 
+    /// <summary>
+    /// Reads the player's current gil. Must be called on the framework thread —
+    /// the UI Draw callback qualifies, so windows can call this directly.
+    /// Returns -1 if the inventory manager is unavailable.
+    /// </summary>
+    public unsafe int GetPlayerGilOnFrame()
+    {
+        var mgr = InventoryManager.Instance();
+        return mgr != null ? (int)mgr->GetInventoryItemCount(1) : -1; // item id 1 = gil
+    }
+
     private static unsafe int GetFreeInventorySlotsUnsafe()
     {
         var mgr = InventoryManager.Instance();
@@ -572,49 +681,148 @@ public sealed class NavigationService : IDisposable
     {
         MissedItems.Clear();
 
-        // Accumulate per ItemId using the original plan as the source of truth for
-        // QuantityNeeded (overflow items carry only the re-routed remainder, which is
-        // already a subset of the original quantity).
+        foreach (var (meta, remaining) in AggregateRemaining(plan, overflowItems))
+            MissedItems.Add(new ShoppingItem
+            {
+                ItemId            = meta.ItemId,
+                Name              = meta.Name,
+                DyeName           = meta.DyeName,
+                QuantityNeeded    = remaining,
+                ResolveQuality    = meta.ResolveQuality,
+                AvailableListings = meta.AvailableListings,
+            });
+
+        if (MissedItems.Count > 0)
+            LogAction($"⚠ {MissedItems.Count} item type(s) not fully purchased — see missed items list.", LogTag.Warning);
+    }
+
+    /// <summary>
+    /// Aggregates needed vs purchased per ItemId across the original plan and every
+    /// overflow item, returning (meta, remaining) for each item not yet fully bought.
+    /// </summary>
+    private static List<(ShoppingItem meta, int remaining)> AggregateRemaining(
+        ShoppingPlan plan, List<ShoppingItem> overflowItems)
+    {
         var totalNeeded    = new Dictionary<int, int>();
         var totalPurchased = new Dictionary<int, int>();
-        var itemMeta       = new Dictionary<int, ShoppingItem>(); // name/dye info
+        var itemMeta       = new Dictionary<int, ShoppingItem>();
 
-        foreach (var item in plan.Groups
-                                 .SelectMany(g => g.Worlds)
-                                 .SelectMany(w => w.Items))
+        foreach (var item in plan.Groups.SelectMany(g => g.Worlds).SelectMany(w => w.Items))
         {
             totalNeeded[item.ItemId]    = totalNeeded.GetValueOrDefault(item.ItemId)    + item.QuantityNeeded;
             totalPurchased[item.ItemId] = totalPurchased.GetValueOrDefault(item.ItemId) + item.QuantityPurchased;
             itemMeta.TryAdd(item.ItemId, item);
         }
 
-        // Add purchases made by overflow (fallback) items — their QuantityNeeded is
-        // already counted in the original, only add what they actually bought.
         foreach (var item in overflowItems)
         {
             totalPurchased[item.ItemId] = totalPurchased.GetValueOrDefault(item.ItemId) + item.QuantityPurchased;
             itemMeta.TryAdd(item.ItemId, item);
         }
 
+        var result = new List<(ShoppingItem, int)>();
         foreach (var (itemId, needed) in totalNeeded)
         {
             var purchased = totalPurchased.GetValueOrDefault(itemId);
-            if (purchased >= needed) continue;
-
-            var meta = itemMeta[itemId];
-            MissedItems.Add(new ShoppingItem
-            {
-                ItemId            = meta.ItemId,
-                Name              = meta.Name,
-                DyeName           = meta.DyeName,
-                QuantityNeeded    = needed - purchased,
-                ResolveQuality    = meta.ResolveQuality,
-                AvailableListings = meta.AvailableListings,
-            });
+            if (purchased < needed) result.Add((itemMeta[itemId], needed - purchased));
         }
+        return result;
+    }
 
-        if (MissedItems.Count > 0)
-            LogAction($"⚠ {MissedItems.Count} item type(s) not fully purchased — see missed items list.", LogTag.Warning);
+    // ── Cross-session run-state persistence ───────────────────────────────────
+
+    private void ProbeSavedRun()
+    {
+        try
+        {
+            if (!File.Exists(_runStatePath)) return;
+            _hasSavedRun = true;
+            var dto = JsonSerializer.Deserialize<RunStateDto>(File.ReadAllText(_runStatePath));
+            if (dto != null)
+                SavedRunInfo = $"{dto.Items.Sum(i => i.QuantityRemaining)} item(s) remaining, " +
+                               $"saved {dto.SavedAt.ToLocalTime():g}";
+        }
+        catch (Exception ex) { _log.Warning($"[HMS] ProbeSavedRun failed: {ex.Message}"); }
+    }
+
+    /// <summary>Writes the remaining items of the active run to disk for crash recovery.</summary>
+    private void SaveRunState()
+    {
+        if (_activePlan == null) return;
+        try
+        {
+            var remaining = AggregateRemaining(_activePlan, _activeOverflow);
+            if (remaining.Count == 0) { ClearRunState(); return; }
+
+            var dto = new RunStateDto
+            {
+                PlayerDc    = _runPlayerDc,
+                PlayerWorld = _runPlayerWorld,
+                SavedAt     = DateTime.UtcNow,
+                Items       = remaining.Select(r => new RunItemDto
+                {
+                    ItemId            = r.meta.ItemId,
+                    Name              = r.meta.Name,
+                    DyeName           = r.meta.DyeName,
+                    QuantityRemaining = r.remaining,
+                    PricePerUnit      = r.meta.PricePerUnit,
+                    IsHighValue       = r.meta.IsHighValue,
+                    ResolveQuality    = r.meta.ResolveQuality,
+                    AvailableListings = r.meta.AvailableListings,
+                }).ToList(),
+            };
+
+            File.WriteAllText(_runStatePath, JsonSerializer.Serialize(dto, RunJsonOpts));
+            _hasSavedRun = true;
+        }
+        catch (Exception ex) { _log.Warning($"[HMS] SaveRunState failed: {ex.Message}"); }
+    }
+
+    private void ClearRunState()
+    {
+        try { if (File.Exists(_runStatePath)) File.Delete(_runStatePath); }
+        catch (Exception ex) { _log.Warning($"[HMS] ClearRunState failed: {ex.Message}"); }
+        _hasSavedRun = false;
+        SavedRunInfo = null;
+    }
+
+    /// <summary>Deletes the saved run snapshot at the user's request.</summary>
+    public void DiscardSavedRun()
+    {
+        ClearRunState();
+        StateChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Loads the saved run snapshot into fresh ShoppingItems (with their remaining
+    /// quantities and cached listings). Returns null if no valid snapshot exists.
+    /// </summary>
+    public (List<ShoppingItem> items, string? playerWorld)? LoadSavedRunItems()
+    {
+        try
+        {
+            if (!File.Exists(_runStatePath)) return null;
+            var dto = JsonSerializer.Deserialize<RunStateDto>(File.ReadAllText(_runStatePath));
+            if (dto == null || dto.Items.Count == 0) return null;
+
+            var items = dto.Items.Select(d => new ShoppingItem
+            {
+                ItemId            = d.ItemId,
+                Name              = d.Name,
+                DyeName           = d.DyeName,
+                QuantityNeeded    = d.QuantityRemaining,
+                PricePerUnit      = d.PricePerUnit,
+                IsHighValue       = d.IsHighValue,
+                ResolveQuality    = d.ResolveQuality,
+                AvailableListings = d.AvailableListings ?? [],
+            }).ToList();
+            return (items, dto.PlayerWorld);
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"[HMS] LoadSavedRunItems failed: {ex.Message}");
+            return null;
+        }
     }
 
     private void LogAction(string msg, LogTag tag = LogTag.Info)

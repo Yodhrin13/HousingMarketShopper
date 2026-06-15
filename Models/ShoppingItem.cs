@@ -36,11 +36,19 @@ public class ShoppingItem
     public int            ItemId         { get; set; }
     public ResolveQuality ResolveQuality { get; set; } = ResolveQuality.Unresolved;
     public string?        ResolveWarning { get; set; }
+    /// <summary>Canonical name of the item this resolved to (for display/verification).</summary>
+    public string?        ResolvedItemName { get; set; }
+    /// <summary>Levenshtein distance for a fuzzy match; 0 for exact/unresolved.</summary>
+    public int            FuzzyDistance  { get; set; }
+    /// <summary>True when the user manually picked the item ID, overriding auto-resolution.</summary>
+    public bool           IsManualOverride { get; set; }
 
     // ── Market data ───────────────────────────────────────────────────────────
     public List<MarketListing> AvailableListings { get; set; } = [];
     public int  PricePerUnit { get; set; }
     public int  TotalPrice   { get; set; }
+    /// <summary>World this item is planned to be purchased from.</summary>
+    public string? SourceWorld { get; set; }
 
     // ── Purchase state ────────────────────────────────────────────────────────
     /// <summary>

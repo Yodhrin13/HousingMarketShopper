@@ -63,14 +63,14 @@ public sealed class Plugin : IDalamudPlugin
         _marketboard = new MarketboardService(
             gameGui, framework, targetManager, objects, marketBoard, _config, log);
         _navSvc      = new NavigationService(pi, commands, framework, _marketboard, objects, clientState, _config, log);
-        _shopList    = new ShoppingListService(_resolver, _universalis, _config, log);
+        _shopList    = new ShoppingListService(pi, _resolver, _universalis, _config, log);
 
         NavigationService = _navSvc;
 
         // Windows
         _confirmWindow = new ConfirmPurchaseWindow(_config);
         _configWindow  = new ConfigWindow(_config);
-        _mainWindow    = new MainWindow(_config, _shopList, _navSvc, objects, log);
+        _mainWindow    = new MainWindow(_config, _shopList, _navSvc, objects);
 
         ConfirmWindow = _confirmWindow;
 

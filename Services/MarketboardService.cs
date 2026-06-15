@@ -46,9 +46,9 @@ public sealed class MarketboardService
     // ── Marketboard NPC name substrings (EN client) ───────────────────────────
     private static readonly string[] MbNpcNames = ["Marketboard", "Market Board"];
 
-    // Maximum price increase (above Universalis snapshot) we auto-accept.
-    // Anything within this ratio is purchased without interruption.
-    private const float MaxPricePremium = 0.20f;
+    // Maximum price increase (above Universalis snapshot) we auto-accept, as a
+    // ratio derived from Configuration.MaxPricePremiumPercent.
+    private float MaxPricePremium => _config.MaxPricePremiumPercent / 100f;
 
     // ── Services ──────────────────────────────────────────────────────────────
     private readonly IGameGui       _gameGui;
@@ -376,32 +376,7 @@ public sealed class MarketboardService
             // which opens ISR and sends the server listing request packet.
             await _framework.RunOnFrameworkThread(() => RequestItemListingsUnsafe(itemId));
 
-            // Wait for IMarketBoard.OfferingsReceived. If no response within 5 s the
-            // server packet was likely dropped — re-dispatch and wait up to 10 s more.
-            IReadOnlyList<IMarketBoardItemListing>? received = null;
-            for (var pass = 0; pass < 2 && received == null; pass++)
-            {
-                if (pass == 1)
-                {
-                    _log.Information($"[HMS] No offerings response after 5 s — re-dispatching listing request for '{itemName}'.");
-                    _offeringsTcs = new TaskCompletionSource<IReadOnlyList<IMarketBoardItemListing>>(
-                        TaskCreationOptions.RunContinuationsAsynchronously);
-                    await _framework.RunOnFrameworkThread(() => RequestItemListingsUnsafe(itemId));
-                }
-
-                try
-                {
-                    using var passTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    passTimeout.CancelAfter(TimeSpan.FromSeconds(pass == 0 ? 5 : 10));
-                    received = await _offeringsTcs.Task.WaitAsync(passTimeout.Token);
-                }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested) { /* retry */ }
-            }
-
-            if (received == null)
-                throw new MarketboardStateException($"No listing response received for '{itemName}' within timeout.");
-
-            _lastOfferings = received;
+            _lastOfferings = await AwaitOfferingsAsync(itemId, itemName, ct);
             _log.Debug($"[HMS] Offerings received for '{itemName}': {_lastOfferings.Count} listing(s).");
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
@@ -431,30 +406,7 @@ public sealed class MarketboardService
         {
             await _framework.RunOnFrameworkThread(() => RequestItemListingsUnsafe(itemId));
 
-            IReadOnlyList<IMarketBoardItemListing>? received = null;
-            for (var pass = 0; pass < 2 && received == null; pass++)
-            {
-                if (pass == 1)
-                {
-                    _log.Information($"[HMS] No refresh response after 5 s — re-dispatching for '{itemName}'.");
-                    _offeringsTcs = new TaskCompletionSource<IReadOnlyList<IMarketBoardItemListing>>(
-                        TaskCreationOptions.RunContinuationsAsynchronously);
-                    await _framework.RunOnFrameworkThread(() => RequestItemListingsUnsafe(itemId));
-                }
-
-                try
-                {
-                    using var passTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    passTimeout.CancelAfter(TimeSpan.FromSeconds(pass == 0 ? 5 : 10));
-                    received = await _offeringsTcs.Task.WaitAsync(passTimeout.Token);
-                }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
-            }
-
-            if (received == null)
-                throw new MarketboardStateException($"No refresh response for '{itemName}' within timeout.");
-
-            _lastOfferings = received;
+            _lastOfferings = await AwaitOfferingsAsync(itemId, itemName, ct);
             _log.Debug($"[HMS] Listings refreshed for '{itemName}': {_lastOfferings.Count} listing(s).");
         }
         finally
@@ -462,6 +414,41 @@ public sealed class MarketboardService
             _offeringsTcs    = null;
             _offeringsItemId = 0;
         }
+    }
+
+    /// <summary>
+    /// Waits for the next <see cref="IMarketBoard.OfferingsReceived"/> for the given item.
+    /// Assumes <see cref="_offeringsTcs"/> is already armed and the initial listing request
+    /// has been dispatched. If nothing arrives within 5 s the server packet was likely
+    /// dropped — re-arms, re-dispatches, and waits up to 10 s more before throwing.
+    /// </summary>
+    private async Task<IReadOnlyList<IMarketBoardItemListing>> AwaitOfferingsAsync(
+        uint itemId, string itemName, CancellationToken ct)
+    {
+        IReadOnlyList<IMarketBoardItemListing>? received = null;
+        for (var pass = 0; pass < 2 && received == null; pass++)
+        {
+            if (pass == 1)
+            {
+                _log.Information($"[HMS] No offerings response after 5 s — re-dispatching listing request for '{itemName}'.");
+                _offeringsTcs = new TaskCompletionSource<IReadOnlyList<IMarketBoardItemListing>>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                await _framework.RunOnFrameworkThread(() => RequestItemListingsUnsafe(itemId));
+            }
+
+            try
+            {
+                using var passTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                passTimeout.CancelAfter(TimeSpan.FromSeconds(pass == 0 ? 5 : 10));
+                received = await _offeringsTcs!.Task.WaitAsync(passTimeout.Token);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { /* retry */ }
+        }
+
+        if (received == null)
+            throw new MarketboardStateException($"No listing response received for '{itemName}' within timeout.");
+
+        return received;
     }
 
     private unsafe void RunTextSearchUnsafe(string itemName)

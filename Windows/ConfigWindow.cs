@@ -52,6 +52,14 @@ public sealed class ConfigWindow : Window
         if (ImGui.Checkbox("Auto-skip items over auto-approve threshold", ref skipHigh))
             cfg.SkipHighValueItems = skipHigh;
 
+        var premium = cfg.MaxPricePremiumPercent;
+        if (ImGui.SliderInt("Max price premium (%)", ref premium, 0, 100))
+            cfg.MaxPricePremiumPercent = premium;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(
+                "How far above the Universalis snapshot price a live listing may be\n" +
+                "and still be bought automatically. Guards against price spikes.");
+
         ImGui.Spacing();
         ImGui.TextUnformatted("Search Preferences");
         ImGui.Separator();
@@ -87,6 +95,20 @@ public sealed class ConfigWindow : Window
             ImGui.SetTooltip(
                 "Items are moved to a world already in the plan when its price is within\n" +
                 "this % of the cheapest. 0 = always buy at the absolute cheapest world.");
+
+        var staleHours = cfg.StaleListingHours;
+        if (ImGui.SliderInt("Stale listing warning (hours)", ref staleHours, 1, 168))
+            cfg.StaleListingHours = staleHours;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Listings older than this are flagged with a ⏱ in the shopping plan.");
+
+        var budgetCap = cfg.BudgetCap;
+        if (ImGui.InputInt("Budget cap (gil, 0 = none)", ref budgetCap, 10000, 100000))
+            cfg.BudgetCap = Math.Max(0, budgetCap);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(
+                "When a plan exceeds this total, the most expensive items are dropped\n" +
+                "until it fits. Dropped items are listed at the bottom of the plan.");
 
         ImGui.Spacing();
         ImGui.TextUnformatted("Navigation");

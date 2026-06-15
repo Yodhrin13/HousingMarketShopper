@@ -16,6 +16,11 @@ public class Configuration : IPluginConfiguration
     public int  MaxPriceWarn        { get; set; } = 500_000;
     /// <summary>When true, items over MaxPriceAutoApprove are skipped automatically.</summary>
     public bool SkipHighValueItems  { get; set; } = false;
+    /// <summary>
+    /// Maximum percentage a live listing may exceed the Universalis snapshot price
+    /// and still be auto-purchased. Guards against buying into a price spike.
+    /// </summary>
+    public int  MaxPricePremiumPercent { get; set; } = 20;
 
     // ── Search preferences ────────────────────────────────────────────────────
     public bool PreferNQ          { get; set; } = true;
@@ -41,6 +46,23 @@ public class Configuration : IPluginConfiguration
     /// is within this percentage of the cheapest world. 0 disables consolidation.
     /// </summary>
     public int WorldConsolidationTolerance { get; set; } = 10;
+
+    /// <summary>
+    /// Maximum total gil for a plan. When the plan exceeds this, the most expensive
+    /// items are dropped until it fits. 0 disables the cap.
+    /// </summary>
+    public int BudgetCap { get; set; } = 0;
+
+    // ── Display ───────────────────────────────────────────────────────────────
+    /// <summary>Listings older than this many hours are flagged as stale in the plan.</summary>
+    public int StaleListingHours { get; set; } = 24;
+
+    // ── Resolution overrides ──────────────────────────────────────────────────
+    /// <summary>
+    /// User-pinned name→itemId resolutions (lowercased parsed name as key). Applied
+    /// before fuzzy matching so a once-corrected item resolves correctly on re-import.
+    /// </summary>
+    public Dictionary<string, int> ResolutionOverrides { get; set; } = [];
 
     // ── UI state ──────────────────────────────────────────────────────────────
     public string LastImportPath { get; set; } = string.Empty;

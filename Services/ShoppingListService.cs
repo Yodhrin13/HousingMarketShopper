@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using HousingMarketShopper.Models;
 
@@ -18,9 +21,17 @@ public sealed class ShoppingListService
     private readonly UniversalisService  _universalis;
     private readonly IPluginLog          _log;
     private readonly Configuration       _cfg;
+    private readonly string              _listsDir;
+
+    private static readonly JsonSerializerOptions ListJsonOpts = new() { WriteIndented = true };
 
     public ShoppingPlan?        CurrentPlan  { get; private set; }
     public List<ShoppingItem>   LoadedItems  { get; private set; } = [];
+
+    // World name → datacenter name, rebuilt from the Universalis catalogue at the
+    // start of each plan build so per-item lookups are O(1) instead of nested scans.
+    private Dictionary<string, string> _worldToDc =
+        new(StringComparer.OrdinalIgnoreCase);
 
 
     // Progress state for the UI
@@ -33,6 +44,7 @@ public sealed class ShoppingListService
     public event Action? StateChanged;
 
     public ShoppingListService(
+        IDalamudPluginInterface pi,
         ItemResolverService resolver,
         UniversalisService  universalis,
         Configuration       cfg,
@@ -42,6 +54,136 @@ public sealed class ShoppingListService
         _universalis = universalis;
         _cfg         = cfg;
         _log         = log;
+        _listsDir    = Path.Combine(pi.GetPluginConfigDirectory(), "lists");
+    }
+
+    // ── Saved lists ───────────────────────────────────────────────────────────
+
+    /// <summary>Lightweight, market-data-free snapshot of a parsed/resolved item.</summary>
+    private sealed class SavedItemDto
+    {
+        public string         RawLine          { get; set; } = "";
+        public string         Name             { get; set; } = "";
+        public string?        DyeName          { get; set; }
+        public int            QuantityNeeded   { get; set; } = 1;
+        public int            ItemId           { get; set; }
+        public ResolveQuality ResolveQuality   { get; set; }
+        public string?        ResolvedItemName { get; set; }
+        public bool           IsManualOverride { get; set; }
+        public bool           Excluded         { get; set; }
+    }
+
+    public List<string> GetSavedListNames()
+    {
+        if (!Directory.Exists(_listsDir)) return [];
+        return [.. Directory.GetFiles(_listsDir, "*.json")
+            .Select(Path.GetFileNameWithoutExtension)
+            .Where(n => !string.IsNullOrEmpty(n))
+            .Select(n => n!)
+            .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)];
+    }
+
+    public void SaveList(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || LoadedItems.Count == 0) return;
+        try
+        {
+            Directory.CreateDirectory(_listsDir);
+            var dtos = LoadedItems.Select(i => new SavedItemDto
+            {
+                RawLine          = i.RawLine,
+                Name             = i.Name,
+                DyeName          = i.DyeName,
+                QuantityNeeded   = i.QuantityNeeded,
+                ItemId           = i.ItemId,
+                ResolveQuality   = i.ResolveQuality,
+                ResolvedItemName = i.ResolvedItemName,
+                IsManualOverride = i.IsManualOverride,
+                Excluded         = i.Excluded,
+            }).ToList();
+
+            File.WriteAllText(PathFor(name), JsonSerializer.Serialize(dtos, ListJsonOpts));
+            StatusMessage = $"Saved list '{name}'.";
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"[HMS] SaveList error: {ex.Message}");
+            StatusMessage = $"Save failed: {ex.Message}";
+        }
+        StateChanged?.Invoke();
+    }
+
+    public void LoadSavedList(string name)
+    {
+        var path = PathFor(name);
+        if (!File.Exists(path)) return;
+        try
+        {
+            var dtos = JsonSerializer.Deserialize<List<SavedItemDto>>(File.ReadAllText(path)) ?? [];
+            LoadedItems = dtos.Select(d => new ShoppingItem
+            {
+                RawLine          = d.RawLine,
+                Name             = d.Name,
+                DyeName          = d.DyeName,
+                QuantityNeeded   = d.QuantityNeeded,
+                ItemId           = d.ItemId,
+                ResolveQuality   = d.ResolveQuality,
+                ResolvedItemName = d.ResolvedItemName,
+                IsManualOverride = d.IsManualOverride,
+                Excluded         = d.Excluded,
+            }).ToList();
+            CurrentPlan   = null;   // prices must be re-fetched for the loaded set
+            StatusMessage = $"Loaded '{name}' ({LoadedItems.Count} items). Fetch prices to build a plan.";
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"[HMS] LoadSavedList error: {ex.Message}");
+            StatusMessage = $"Load failed: {ex.Message}";
+        }
+        StateChanged?.Invoke();
+    }
+
+    public void DeleteSavedList(string name)
+    {
+        try
+        {
+            var path = PathFor(name);
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch (Exception ex) { _log.Error($"[HMS] DeleteSavedList error: {ex.Message}"); }
+        StateChanged?.Invoke();
+    }
+
+    private string PathFor(string name)
+    {
+        var safe = string.Concat(name.Split(Path.GetInvalidFileNameChars())).Trim();
+        if (string.IsNullOrEmpty(safe)) safe = "list";
+        return Path.Combine(_listsDir, safe + ".json");
+    }
+
+    // ── Manual resolution ─────────────────────────────────────────────────────
+
+    /// <summary>Case-insensitive item-name search for the manual-resolution picker.</summary>
+    public List<(int id, string name)> SearchItems(string query, int limit = 100)
+        => _resolver.SearchItems(query, limit);
+
+    /// <summary>
+    /// Pins a loaded item to a specific item ID, marks it a manual override, and
+    /// persists the mapping so future imports of the same name resolve automatically.
+    /// </summary>
+    public void ApplyManualResolution(ShoppingItem item, int itemId)
+    {
+        item.ItemId           = itemId;
+        item.ResolveQuality   = ResolveQuality.Exact;
+        item.ResolvedItemName = _resolver.GetItemName(itemId);
+        item.IsManualOverride = true;
+        item.FuzzyDistance    = 0;
+        item.ResolveWarning   = null;
+
+        var key = item.Name.ToLowerInvariant().Trim();
+        _cfg.ResolutionOverrides[key] = itemId;
+        _cfg.Save();
+        StateChanged?.Invoke();
     }
 
     // ── Step 1: Load and resolve items from file ──────────────────────────────
@@ -57,6 +199,10 @@ public sealed class ShoppingListService
             await _resolver.LoadDataAsync(ct);
             StatusMessage = "Parsing file…";
             StateChanged?.Invoke();
+
+            // Apply the user's pinned resolution overrides before parsing.
+            _resolver.Overrides = new Dictionary<string, int>(
+                _cfg.ResolutionOverrides, StringComparer.OrdinalIgnoreCase);
 
             LoadedItems = await Task.Run(() => _resolver.ParseFile(filePath), ct);
 
@@ -190,6 +336,7 @@ public sealed class ShoppingListService
 
     private ShoppingPlan BuildPlanItems(ShoppingPlan plan, List<ShoppingItem> resolvedItems, string? playerWorld)
     {
+        BuildWorldToDcMap();
 
         // For each resolved, non-excluded item, find the best source world
         var worldGroups = new Dictionary<string, (string dc, List<ShoppingItem> items)>(
@@ -235,6 +382,7 @@ public sealed class ShoppingListService
             item.IsHighValue  = item.PricePerUnit > _cfg.MaxPriceAutoApprove;
 
             var worldName = best.Value.world;
+            item.SourceWorld = worldName;
             var dc        = FindDCForWorld(worldName);
 
             var key = worldName;
@@ -242,6 +390,11 @@ public sealed class ShoppingListService
                 worldGroups[key] = (dc, []);
             worldGroups[key].items.Add(item);
         }
+
+        // Snapshot the absolute-cheapest assignment (pre-consolidation) so the UI can
+        // report how much the consolidation tolerance costs in exchange for fewer hops.
+        plan.PreConsolidationCost       = worldGroups.Sum(kv => kv.Value.items.Sum(i => i.TotalPrice));
+        plan.PreConsolidationWorldCount = worldGroups.Count;
 
         // ── Consolidation pass ─────────────────────────────────────────────────
         // Reassign items to an already-planned world when the price difference is
@@ -282,6 +435,7 @@ public sealed class ShoppingListService
                             item.PricePerUnit = cost.ppu;
                             item.TotalPrice   = cost.total;
                             item.IsHighValue  = item.PricePerUnit > _cfg.MaxPriceAutoApprove;
+                            item.SourceWorld  = bestTarget;
                             worldGroups[bestTarget].items.Add(item);
 
                             if (srcEntry.items.Count == 0)
@@ -294,6 +448,28 @@ public sealed class ShoppingListService
                     if (changed) break;
                 }
             } while (changed);
+        }
+
+        // ── Budget cap ─────────────────────────────────────────────────────────
+        // Drop the most expensive items until the plan total fits under the cap.
+        if (_cfg.BudgetCap > 0)
+        {
+            var assigned = worldGroups
+                .SelectMany(kv => kv.Value.items.Select(i => (world: kv.Key, item: i)))
+                .OrderByDescending(x => x.item.TotalPrice)
+                .ToList();
+
+            var runningTotal = assigned.Sum(x => x.item.TotalPrice);
+            foreach (var (world, item) in assigned)
+            {
+                if (runningTotal <= _cfg.BudgetCap) break;
+                worldGroups[world].items.Remove(item);
+                item.Status = PurchaseStatus.Skipped;
+                plan.OverBudget.Add(item);
+                runningTotal -= item.TotalPrice;
+                if (worldGroups[world].items.Count == 0)
+                    worldGroups.Remove(world);
+            }
         }
 
         // Group into DC → World hierarchy
@@ -388,27 +564,31 @@ public sealed class ShoppingListService
         return remaining > 0 ? null : (worstPpu, total);
     }
 
-    private string FindDCForWorld(string worldName)
+    /// <summary>
+    /// Rebuilds the world→DC lookup from the Universalis catalogue. Each DC lists its
+    /// world IDs; we resolve those IDs to names via the resolver's WorldMap, falling
+    /// back to the Universalis worlds list for any the resolver doesn't know.
+    /// </summary>
+    private void BuildWorldToDcMap()
     {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var dc in _universalis.DataCenters)
         {
-            var worldIds = dc.Worlds;
-            foreach (var wId in worldIds)
+            foreach (var wId in dc.Worlds)
             {
-                if (_resolver.WorldMap.TryGetValue(wId, out var w) &&
-                    w.Name.Equals(worldName, StringComparison.OrdinalIgnoreCase))
-                    return dc.Name;
-            }
-            // Also check by name via the Universalis worlds list
-            var worldEntry = _universalis.Worlds.FirstOrDefault(w =>
-                w.Name.Equals(worldName, StringComparison.OrdinalIgnoreCase));
-            if (worldEntry != null)
-            {
-                var match = _universalis.DataCenters.FirstOrDefault(d =>
-                    d.Worlds.Contains(worldEntry.Id));
-                if (match != null) return match.Name;
+                string? name = _resolver.WorldMap.TryGetValue(wId, out var w)
+                    ? w.Name
+                    : _universalis.Worlds.FirstOrDefault(uw => uw.Id == wId)?.Name;
+
+                if (!string.IsNullOrEmpty(name))
+                    map[name] = dc.Name;
             }
         }
-        return "Unknown";
+
+        _worldToDc = map;
     }
+
+    private string FindDCForWorld(string worldName)
+        => _worldToDc.TryGetValue(worldName, out var dc) ? dc : "Unknown";
 }
