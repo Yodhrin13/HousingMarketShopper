@@ -161,11 +161,72 @@ public sealed class ShoppingListService
         return Path.Combine(_listsDir, safe + ".json");
     }
 
+    // ── Quick add ─────────────────────────────────────────────────────────────
+
+    /// <summary>True once the item-name catalogue is loaded and search is usable.</summary>
+    public bool IsItemDataReady => _resolver.IsItemDataLoaded;
+
+    /// <summary>Loads the item catalogue if it isn't already (for quick-add without a file).</summary>
+    public async Task EnsureItemDataAsync(CancellationToken ct = default)
+    {
+        if (_resolver.IsItemDataLoaded || IsLoading) return;
+
+        IsLoading     = true;
+        StatusMessage = "Loading item database…";
+        StateChanged?.Invoke();
+        try
+        {
+            await _resolver.LoadDataAsync(ct);
+            _resolver.Overrides = new Dictionary<string, int>(
+                _cfg.ResolutionOverrides, StringComparer.OrdinalIgnoreCase);
+            StatusMessage = $"Item database ready ({_resolver.ItemNames.Count:N0} items).";
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"[HMS] EnsureItemDataAsync error: {ex}");
+            StatusMessage = $"Error: {ex.Message}";
+        }
+        finally
+        {
+            IsLoading = false;
+            StateChanged?.Invoke();
+        }
+    }
+
+    /// <summary>
+    /// Adds a directly-chosen (already resolved) item to the loaded list, or bumps
+    /// its quantity if it's already present.
+    /// </summary>
+    public void AddQuickItem(int itemId, string name)
+    {
+        var existing = LoadedItems.FirstOrDefault(i => i.ItemId == itemId && i.IsResolved);
+        if (existing != null)
+        {
+            existing.QuantityNeeded++;
+        }
+        else
+        {
+            LoadedItems.Add(new ShoppingItem
+            {
+                RawLine          = name,
+                Name             = name,
+                QuantityNeeded   = 1,
+                ItemId           = itemId,
+                ResolveQuality   = ResolveQuality.Exact,
+                ResolvedItemName = name,
+            });
+        }
+        StateChanged?.Invoke();
+    }
+
     // ── Manual resolution ─────────────────────────────────────────────────────
 
     /// <summary>Case-insensitive item-name search for the manual-resolution picker.</summary>
     public List<(int id, string name)> SearchItems(string query, int limit = 100)
         => _resolver.SearchItems(query, limit);
+
+    /// <summary>True if the item is sold by an NPC vendor for gil (likely cheaper than the MB).</summary>
+    public bool IsVendorSold(int itemId) => _resolver.IsNpcSold(itemId);
 
     /// <summary>
     /// Pins a loaded item to a specific item ID, marks it a manual override, and
@@ -370,11 +431,10 @@ public sealed class ShoppingListService
 
             if (best == null)
             {
-                // Listings exist but no single world has enough stock — take cheapest from filtered set
-                var cheapest = listings
-                    .OrderBy(l => l.PricePerUnit).First();
-                best = (cheapest.WorldName, cheapest.PricePerUnit,
-                        cheapest.PricePerUnit * item.QuantityNeeded);
+                // No single world has enough stock. Estimate the realistic cost by buying
+                // the cheapest listings across ALL worlds (the run re-routes overflow between
+                // worlds), instead of assuming the full quantity at the single cheapest price.
+                best = EstimateAcrossWorlds(listings, item.QuantityNeeded);
             }
 
             item.PricePerUnit = best.Value.pricePerUnit;
@@ -535,6 +595,44 @@ public sealed class ShoppingListService
         }
 
         return dcs;
+    }
+
+    /// <summary>
+    /// Greedily fills <paramref name="quantityNeeded"/> from the cheapest listings across
+    /// all worlds (respecting NQ preference), summing actual listing prices. Used when no
+    /// single world can fill the order — the run buys across worlds via overflow re-routing.
+    /// Returns the world supplying the most units as the primary source, the worst per-unit
+    /// price consumed (so the run's price tolerance stays generous enough), and the true total.
+    /// </summary>
+    private (string world, int pricePerUnit, int totalCost) EstimateAcrossWorlds(
+        List<MarketListing> listings, int quantityNeeded)
+    {
+        var candidates = _cfg.PreferNQ ? listings.Where(l => !l.IsHQ).ToList() : [.. listings];
+        if (candidates.Count == 0) candidates = [.. listings];
+
+        var sorted      = candidates.OrderBy(l => l.PricePerUnit).ToList();
+        var remaining   = quantityNeeded;
+        var total       = 0;
+        var worstPpu    = sorted[0].PricePerUnit;
+        var perWorldQty = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var l in sorted)
+        {
+            if (remaining <= 0) break;
+            var take = Math.Min(remaining, l.Quantity);
+            total      += take * l.PricePerUnit;
+            worstPpu    = l.PricePerUnit;
+            perWorldQty[l.WorldName] = perWorldQty.GetValueOrDefault(l.WorldName) + take;
+            remaining  -= take;
+        }
+
+        // Primary source = the world contributing the most units, to minimise re-routes.
+        var primaryWorld = perWorldQty
+            .OrderByDescending(kv => kv.Value)
+            .ThenBy(kv => kv.Key)
+            .First().Key;
+
+        return (primaryWorld, worstPpu, total);
     }
 
     private (int ppu, int total)? CalcWorldCost(ShoppingItem item, string worldName)

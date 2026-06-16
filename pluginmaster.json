@@ -3,8 +3,8 @@
     "Author": "Yodhrin13",
     "Name": "HousingMarketShopper",
     "InternalName": "HousingMarketShopper",
-    "AssemblyVersion": "1.0.3.0",
-    "TestingAssemblyVersion": "1.0.3.0",
+    "AssemblyVersion": "1.1.0.0",
+    "TestingAssemblyVersion": "1.1.0.0",
     "Punchline": "Automatically source and buy housing furnishings at the best cross-world price.",
     "Description": "Reads a MakePlace furnishing list, finds the cheapest market listings across all worlds via Universalis, then automates world-hopping and purchasing via Lifestream.",
     "Tags": [
@@ -23,7 +23,7 @@
     "DownloadLinkTesting": "https://github.com/Yodhrin13/HousingMarketShopper/releases/latest/download/latest.zip",
     "DownloadLinkUpdate": "https://github.com/Yodhrin13/HousingMarketShopper/releases/latest/download/latest.zip",
     "LastUpdated": 1781558364,
-    "Changelog": "1.0.3\r\n- New: manual + persistent item resolution — Fix unresolved/fuzzy items via a searchable picker; corrections are remembered across imports\r\n- New: save, load, and delete named shopping lists\r\n- New: resume an interrupted run after a crash or logout (progress saved to disk)\r\n- New: dry-run mode logs the full route and intended purchases without buying\r\n- New: budget cap drops the most expensive items to keep a plan under a gil ceiling\r\n- New: gil-on-hand check warns when a plan exceeds your current gil\r\n- New: per-item world-price comparison popup and an Open on Universalis link\r\n- New: plan sort/filter, consolidation savings, and a rough travel-time estimate\r\n- New: confirm dialog shows the expected source world and listings/retainers\r\n- New: configurable price-premium tolerance and stale-listing threshold\r\n- New: inline quantity editing and resolution confidence in the Import tab",
+    "Changelog": "1.1.0\n- New: Quick Add — build a list by typing item names with live search suggestions\n- New: items sold by NPC vendors for gil are flagged in the Import tab so you don't overpay on the market board\n- Fix: accurate pricing when no single world has enough stock — totals now sum the real cheapest listings across worlds instead of assuming the cheapest price for the whole quantity\n- Fix: Universalis 504 timeouts greatly reduced (skip unused sale-history, smaller request batches)\n- Fix: price fetch no longer spams errors when the plugin is reloaded mid-fetch\n- Fix: world-price comparison popup shows per-world stock and the true total for the needed quantity\n- Change: datacenters outside your region are now clearly disabled in Settings (cross-region travel isn't possible in-game)\n- Fix: replaced UI symbols that rendered as blank boxes in the game font",
     "DownloadCount": 0
   }
 ]

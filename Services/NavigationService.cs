@@ -195,7 +195,7 @@ public sealed class NavigationService : IDisposable
                         if (!arrived)
                         {
                             congestedWorlds.Add(worldGroup.WorldName);
-                            LogAction($"⚠ {worldGroup.WorldName} is congested — re-routing items.", LogTag.Warning);
+                            LogAction($"(!) {worldGroup.WorldName} is congested — re-routing items.", LogTag.Warning);
                             foreach (var i in worldGroup.Items)
                             {
                                 var alt = FindFallbackWorld(i, congestedWorlds);
@@ -208,7 +208,7 @@ public sealed class NavigationService : IDisposable
                                 {
                                     if (!fallbackQueue.ContainsKey(alt)) fallbackQueue[alt] = [];
                                     fallbackQueue[alt].Add(i);
-                                    LogAction($"  {i.Name} → {alt}", LogTag.Warning);
+                                    LogAction($"  {i.Name} -> {alt}", LogTag.Warning);
                                 }
                             }
                             continue;
@@ -249,7 +249,7 @@ public sealed class NavigationService : IDisposable
                             if (!arrived)
                             {
                                 congestedWorlds.Add(fallbackWorld);
-                                LogAction($"⚠ Fallback world {fallbackWorld} also congested — items skipped.", LogTag.Error);
+                                LogAction($"(!) Fallback world {fallbackWorld} also congested — items skipped.", LogTag.Error);
                                 foreach (var i in items) i.Status = PurchaseStatus.Skipped;
                                 continue;
                             }
@@ -363,7 +363,7 @@ public sealed class NavigationService : IDisposable
                     if (!fallbackQueue.ContainsKey(altWorld)) fallbackQueue[altWorld] = [];
                     fallbackQueue[altWorld].Add(overflow);
                     allOverflowItems.Add(overflow); // track for end-of-run summary
-                    LogAction($"  Routing {remaining}× {item.Name} → {altWorld}", LogTag.Warning);
+                    LogAction($"  Routing {remaining}× {item.Name} -> {altWorld}", LogTag.Warning);
                 }
                 else
                 {
@@ -400,7 +400,7 @@ public sealed class NavigationService : IDisposable
             {
                 worldCount++;
                 LogAction(
-                    $"  → {w.WorldName}  ({w.Items.Count} items, ~{w.TotalEstimatedCost:N0} gil)",
+                    $"  -> {w.WorldName}  ({w.Items.Count} items, ~{w.TotalEstimatedCost:N0} gil)",
                     LogTag.Navigation);
                 foreach (var item in w.Items.OrderByDescending(i => i.TotalPrice))
                 {
@@ -513,10 +513,10 @@ public sealed class NavigationService : IDisposable
 
         var (statusStr, statusTag) = result.Outcome switch
         {
-            PurchaseOutcome.Success   => ($"✓ {result.QuantityPurchased}× for {result.TotalSpent:N0} gil", LogTag.Success),
+            PurchaseOutcome.Success   => ($"[ok] {result.QuantityPurchased}× for {result.TotalSpent:N0} gil", LogTag.Success),
             PurchaseOutcome.Partial   => ($"~ {result.QuantityPurchased}/{item.QuantityNeeded}× for {result.TotalSpent:N0} gil", LogTag.Partial),
-            PurchaseOutcome.NotListed => ("✗ not listed", LogTag.Warning),
-            _                         => ($"✗ {result.Outcome}: {result.FailureReason}", LogTag.Error),
+            PurchaseOutcome.NotListed => ("[x] not listed", LogTag.Warning),
+            _                         => ($"[x] {result.Outcome}: {result.FailureReason}", LogTag.Error),
         };
 
         LogAction($"  {item.Name}: {statusStr}", statusTag);
@@ -584,7 +584,7 @@ public sealed class NavigationService : IDisposable
 
     /// <summary>
     /// Predictive inventory check. Loops until the player has deposited enough
-    /// items that <c>freeSlots - slotsNeededHere ≥ InventoryPauseThreshold</c>.
+    /// items that <c>freeSlots - slotsNeededHere >= InventoryPauseThreshold</c>.
     /// </summary>
     private async Task CheckInventoryAndPauseAsync(
         string worldName, int slotsNeededHere, int futureItems, CancellationToken ct)
@@ -606,8 +606,8 @@ public sealed class NavigationService : IDisposable
             IsInventoryPause     = true;
 
             LogAction(
-                $"⚠ Inventory: {free} free, ~{slotsNeededHere} needed for {worldName} " +
-                $"(+{futureItems} items remain after). Deposit ≥{needed} items then Resume.",
+                $"(!) Inventory: {free} free, ~{slotsNeededHere} needed for {worldName} " +
+                $"(+{futureItems} items remain after). Deposit >={needed} items then Resume.",
                 LogTag.Warning);
 
             IsPaused = true;
@@ -693,7 +693,7 @@ public sealed class NavigationService : IDisposable
             });
 
         if (MissedItems.Count > 0)
-            LogAction($"⚠ {MissedItems.Count} item type(s) not fully purchased — see missed items list.", LogTag.Warning);
+            LogAction($"(!) {MissedItems.Count} item type(s) not fully purchased — see missed items list.", LogTag.Warning);
     }
 
     /// <summary>

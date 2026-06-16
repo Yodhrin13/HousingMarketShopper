@@ -32,8 +32,9 @@ public sealed class MainWindow : Window, IDisposable
     private string        _resolveSearch    = "";
     private bool          _openResolvePopup;
 
-    // ── Saved-lists state ─────────────────────────────────────────────────────
+    // ── Saved-lists / quick-add state ─────────────────────────────────────────
     private string _saveListName = "";
+    private string _quickSearch  = "";
 
     // ── Plan tab view state ───────────────────────────────────────────────────
     private int           _planSortMode;            // 0 price↓, 1 price↑, 2 name, 3 qty↓
@@ -41,7 +42,7 @@ public sealed class MainWindow : Window, IDisposable
     private ShoppingItem? _compareTarget;
     private bool          _openComparePopup;
     private static readonly string[] PlanSortLabels =
-        ["Price (high→low)", "Price (low→high)", "Name (A→Z)", "Quantity (high→low)"];
+        ["Price (high->low)", "Price (low->high)", "Name (A->Z)", "Quantity (high->low)"];
 
     public MainWindow(
         Configuration       cfg,
@@ -116,7 +117,8 @@ public sealed class MainWindow : Window, IDisposable
             ImGui.TextUnformatted(_shopList.StatusMessage);
         }
 
-        // ── Saved lists ───────────────────────────────────────────────────────
+        // ── Quick add & saved lists ───────────────────────────────────────────
+        DrawQuickAdd();
         DrawSavedLists();
 
         // ── Item list with resolution status ──────────────────────────────────
@@ -175,6 +177,52 @@ public sealed class MainWindow : Window, IDisposable
         }
 
         DrawResolvePicker();
+    }
+
+    // ── Quick add ─────────────────────────────────────────────────────────────
+
+    private void DrawQuickAdd()
+    {
+        if (!ImGui.CollapsingHeader("Quick Add Items")) return;
+
+        if (!_shopList.IsItemDataReady)
+        {
+            if (_shopList.IsLoading)
+            {
+                ImGui.TextDisabled("Loading item database…");
+            }
+            else
+            {
+                ImGui.TextDisabled("Load the item database to search and add items directly.");
+                if (ImGui.Button("Load Item Database"))
+                    _ = _shopList.EnsureItemDataAsync();
+            }
+            return;
+        }
+
+        ImGui.SetNextItemWidth(320f);
+        ImGui.InputTextWithHint("##quickSearch", "Type an item name…", ref _quickSearch, 128);
+        ImGui.SameLine();
+        ImGui.TextDisabled("click a suggestion to add ×1");
+
+        if (string.IsNullOrWhiteSpace(_quickSearch)) return;
+
+        if (ImGui.BeginChild("##quickSuggest", new Vector2(0, 170), true))
+        {
+            var matches = _shopList.SearchItems(_quickSearch, 50);
+            if (matches.Count == 0)
+                ImGui.TextDisabled("No matches.");
+            foreach (var (id, name) in matches)
+            {
+                if (ImGui.Selectable($"{name}##q{id}"))
+                {
+                    _shopList.AddQuickItem(id, name);
+                    _quickSearch = "";
+                    break;
+                }
+            }
+            ImGui.EndChild();
+        }
     }
 
     // ── Saved lists ───────────────────────────────────────────────────────────
@@ -312,13 +360,13 @@ public sealed class MainWindow : Window, IDisposable
             {
                 ImGui.SameLine();
                 ImGui.TextColored(new Vector4(0.4f, 0.8f, 1f, 1f),
-                    $"→ {item.ResolvedItemName} (manual)");
+                    $"-> {item.ResolvedItemName} (manual)");
             }
             else if (item.ResolveQuality == ResolveQuality.FuzzyMatch)
             {
                 ImGui.SameLine();
                 ImGui.TextColored(new Vector4(1f, 0.85f, 0.2f, 1f),
-                    $"≈ {item.ResolvedItemName} (dist {item.FuzzyDistance})");
+                    $"~ {item.ResolvedItemName} (dist {item.FuzzyDistance})");
             }
             else if (item.ResolveQuality == ResolveQuality.Unresolved)
             {
@@ -333,6 +381,17 @@ public sealed class MainWindow : Window, IDisposable
             ImGui.SameLine();
             if (ImGui.SmallButton($"Fix##fix{idx}"))
                 OpenResolvePicker(item);
+        }
+
+        // Warn if the item is sold by an NPC vendor for gil — no need to buy off the MB.
+        if (!item.Excluded && item.IsResolved && _shopList.IsVendorSold(item.ItemId))
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.3f, 0.85f, 0.9f, 1f), "[NPC vendor]");
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(
+                    "This furnishing is sold by an NPC vendor for gil —\n" +
+                    "you can likely buy it directly instead of off the market board.");
         }
     }
 
@@ -363,7 +422,7 @@ public sealed class MainWindow : Window, IDisposable
         {
             if (gil < plan.TotalEstimatedCost)
                 ImGui.TextColored(new Vector4(1f, 0.45f, 0.3f, 1f),
-                    $"⚠ You have {gil:N0} gil — short by ~{plan.TotalEstimatedCost - gil:N0}.");
+                    $"(!) You have {gil:N0} gil — short by ~{plan.TotalEstimatedCost - gil:N0}.");
             else
                 ImGui.TextColored(new Vector4(0.5f, 0.85f, 0.5f, 1f),
                     $"You have {gil:N0} gil (~{gil - plan.TotalEstimatedCost:N0} to spare).");
@@ -376,7 +435,7 @@ public sealed class MainWindow : Window, IDisposable
         {
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.6f, 0.1f, 1f));
             ImGui.TextWrapped(
-                "⚠ Requires the Lifestream plugin to be installed and enabled. Automation unavailable.");
+                "(!) Requires the Lifestream plugin to be installed and enabled. Automation unavailable.");
             ImGui.PopStyleColor();
             ImGui.Spacing();
         }
@@ -484,7 +543,7 @@ public sealed class MainWindow : Window, IDisposable
                                       :            Vector4.One;
                         ImGui.PushStyleColor(ImGuiCol.Text, textColor);
 
-                        var prefix = (isStale ? "⏱ " : "") + (isHigh ? "⚠ " : "");
+                        var prefix = (isStale ? "(stale) " : "") + (isHigh ? "(!) " : "");
                         var name   = item.DyeName != null
                             ? $"{prefix}{item.Name} ({item.DyeName})"
                             : $"{prefix}{item.Name}";
@@ -533,7 +592,7 @@ public sealed class MainWindow : Window, IDisposable
             ImGui.TextColored(new Vector4(1f, 0.3f, 0.3f, 1f),
                 $"Unresolved ({plan.Unresolved.Count}):");
             foreach (var u in plan.Unresolved)
-                ImGui.TextUnformatted($"  • {u.Name}");
+                ImGui.TextUnformatted($"  - {u.Name}");
         }
 
         if (plan.NotListed.Count > 0)
@@ -542,7 +601,7 @@ public sealed class MainWindow : Window, IDisposable
             ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f),
                 $"Not listed on market ({plan.NotListed.Count}):");
             foreach (var nl in plan.NotListed)
-                ImGui.TextUnformatted($"  • {nl.Name}");
+                ImGui.TextUnformatted($"  - {nl.Name}");
         }
 
         if (plan.OverBudget.Count > 0)
@@ -551,7 +610,7 @@ public sealed class MainWindow : Window, IDisposable
             ImGui.TextColored(new Vector4(1f, 0.6f, 0.1f, 1f),
                 $"Dropped — over budget cap ({plan.OverBudget.Count}):");
             foreach (var ob in plan.OverBudget)
-                ImGui.TextUnformatted($"  • {ob.Name}  ×{ob.QuantityNeeded}  (~{ob.TotalPrice:N0} gil)");
+                ImGui.TextUnformatted($"  - {ob.Name}  ×{ob.QuantityNeeded}  (~{ob.TotalPrice:N0} gil)");
         }
 
         ImGui.EndChild();
@@ -566,7 +625,7 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.10f, 0.20f, 0.30f, 1f));
         if (ImGui.BeginChild("##resumeBanner", new Vector2(0, 76), true))
         {
-            ImGui.TextColored(new Vector4(0.5f, 0.8f, 1f, 1f), "⟳  Interrupted run found");
+            ImGui.TextColored(new Vector4(0.5f, 0.8f, 1f, 1f), "Interrupted run found");
             if (_nav.SavedRunInfo != null)
                 ImGui.TextDisabled(_nav.SavedRunInfo);
             ImGui.Spacing();
@@ -694,7 +753,7 @@ public sealed class MainWindow : Window, IDisposable
                     var chosen = _compareTarget.SourceWorld != null &&
                                  w.World.Equals(_compareTarget.SourceWorld, StringComparison.OrdinalIgnoreCase);
                     if (chosen)
-                        ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), $"● {w.World}");
+                        ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), $"* {w.World}");
                     else if (!w.CanFill)
                         ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), $"   {w.World}");
                     else
@@ -755,11 +814,11 @@ public sealed class MainWindow : Window, IDisposable
             if (ImGui.BeginChild("##invBanner", new Vector2(0, 80), true))
             {
                 ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.7f, 0.1f, 1f));
-                ImGui.TextUnformatted("⚠  Inventory Nearly Full — Deposit Required");
+                ImGui.TextUnformatted("(!)  Inventory Nearly Full — Deposit Required");
                 ImGui.PopStyleColor();
                 ImGui.TextUnformatted(
                     $"Free slots: {_nav.InventoryFreeSlots}  |  " +
-                    $"Need to deposit: ≥{_nav.InventorySlotsNeeded}  |  " +
+                    $"Need to deposit: >={_nav.InventorySlotsNeeded}  |  " +
                     $"Items remaining in plan: {_nav.InventoryFutureItems}");
                 ImGui.Spacing();
                 if (ImGui.Button("Teleport to Ul'dah to Deposit"))
@@ -804,7 +863,7 @@ public sealed class MainWindow : Window, IDisposable
         {
             ImGui.Spacing();
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.4f, 0.4f, 1f));
-            ImGui.TextUnformatted($"⚠  {_nav.MissedItems.Count} item type(s) not fully purchased:");
+            ImGui.TextUnformatted($"(!)  {_nav.MissedItems.Count} item type(s) not fully purchased:");
             ImGui.PopStyleColor();
             ImGui.Spacing();
 
@@ -814,8 +873,8 @@ public sealed class MainWindow : Window, IDisposable
                 foreach (var missed in _nav.MissedItems)
                 {
                     var label = missed.DyeName != null
-                        ? $"• {missed.Name} ({missed.DyeName})  ×{missed.QuantityNeeded}"
-                        : $"• {missed.Name}  ×{missed.QuantityNeeded}";
+                        ? $"- {missed.Name} ({missed.DyeName})  ×{missed.QuantityNeeded}"
+                        : $"- {missed.Name}  ×{missed.QuantityNeeded}";
                     ImGui.TextUnformatted(label);
                 }
                 ImGui.EndChild();
@@ -874,7 +933,7 @@ public sealed class MainWindow : Window, IDisposable
 
     // ── Settings tab ──────────────────────────────────────────────────────────
 
-    private void DrawSettingsTab() => ConfigWindow.DrawContent(_cfg);
+    private void DrawSettingsTab() => ConfigWindow.DrawContent(_cfg, GetPlayerDcName());
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 

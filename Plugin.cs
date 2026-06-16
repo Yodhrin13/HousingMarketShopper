@@ -69,7 +69,11 @@ public sealed class Plugin : IDalamudPlugin
 
         // Windows
         _confirmWindow = new ConfirmPurchaseWindow(_config);
-        _configWindow  = new ConfigWindow(_config);
+        _configWindow  = new ConfigWindow(_config, () =>
+        {
+            try { return objects.LocalPlayer?.CurrentWorld.ValueNullable?.DataCenter.ValueNullable?.Name.ToString(); }
+            catch { return null; }
+        });
         _mainWindow    = new MainWindow(_config, _shopList, _navSvc, objects);
 
         ConfirmWindow = _confirmWindow;

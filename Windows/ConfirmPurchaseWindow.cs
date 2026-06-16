@@ -73,7 +73,7 @@ public sealed class ConfirmPurchaseWindow : Window
             ImGui.Spacing();
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.2f, 0.2f, 1f));
             ImGui.TextWrapped(
-                $"⚠ This item exceeds the warning threshold of {_cfg.MaxPriceWarn:N0} gil!");
+                $"(!) This item exceeds the warning threshold of {_cfg.MaxPriceWarn:N0} gil!");
             ImGui.PopStyleColor();
         }
 

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Dalamud.Interface.Windowing;
 using Dalamud.Bindings.ImGui;
 using System;
@@ -9,6 +10,7 @@ namespace HousingMarketShopper.Windows;
 public sealed class ConfigWindow : Window
 {
     private readonly Configuration _cfg;
+    private readonly Func<string?>? _getPlayerDc;
 
     // Region → ordered DC list, in the order we want to display them.
     private static readonly (string Region, string[] DCs)[] KnownRegions =
@@ -19,11 +21,12 @@ public sealed class ConfigWindow : Window
         ("OCE", ["Materia"]),
     ];
 
-    public ConfigWindow(Configuration cfg)
+    public ConfigWindow(Configuration cfg, Func<string?>? getPlayerDc = null)
         : base("HousingMarketShopper Settings##HMS",
                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoCollapse)
     {
-        _cfg    = cfg;
+        _cfg         = cfg;
+        _getPlayerDc = getPlayerDc;
         IsOpen  = false;
         SizeConstraints = new WindowSizeConstraints
         {
@@ -32,10 +35,10 @@ public sealed class ConfigWindow : Window
         };
     }
 
-    public override void Draw() => DrawContent(_cfg);
+    public override void Draw() => DrawContent(_cfg, _getPlayerDc?.Invoke());
 
     /// <summary>Draws the settings UI inline (usable inside a tab too).</summary>
-    public static void DrawContent(Configuration cfg)
+    public static void DrawContent(Configuration cfg, string? playerDc = null)
     {
         ImGui.TextUnformatted("Price Thresholds");
         ImGui.Separator();
@@ -100,7 +103,7 @@ public sealed class ConfigWindow : Window
         if (ImGui.SliderInt("Stale listing warning (hours)", ref staleHours, 1, 168))
             cfg.StaleListingHours = staleHours;
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Listings older than this are flagged with a ⏱ in the shopping plan.");
+            ImGui.SetTooltip("Listings older than this are flagged with a (stale) in the shopping plan.");
 
         var budgetCap = cfg.BudgetCap;
         if (ImGui.InputInt("Budget cap (gil, 0 = none)", ref budgetCap, 10000, 100000))
@@ -127,12 +130,28 @@ public sealed class ConfigWindow : Window
         ImGui.TextUnformatted("Enabled Datacenters");
         ImGui.Separator();
         ImGui.TextDisabled("Uncheck to skip a datacenter when fetching prices and shopping.");
+
+        // The game can't travel cross-region, so only the player's own region is searched.
+        // Determine the player's region (by their current DC) and disable the others.
+        var playerRegion = string.IsNullOrEmpty(playerDc)
+            ? null
+            : KnownRegions
+                .FirstOrDefault(r => r.DCs.Any(d => d.Equals(playerDc, StringComparison.OrdinalIgnoreCase)))
+                .Region;
+
+        if (playerRegion != null)
+            ImGui.TextDisabled($"Only your region ({playerRegion}) can be reached — others are disabled.");
         ImGui.Spacing();
 
         foreach (var (region, dcs) in KnownRegions)
         {
+            var reachable = playerRegion == null ||
+                            region.Equals(playerRegion, StringComparison.OrdinalIgnoreCase);
+
             ImGui.TextUnformatted(region);
             ImGui.SameLine(50f);
+
+            if (!reachable) ImGui.BeginDisabled();
             for (var i = 0; i < dcs.Length; i++)
             {
                 var dc      = dcs[i];
@@ -143,6 +162,12 @@ public sealed class ConfigWindow : Window
                     else         cfg.DisabledDataCenters.Add(dc);
                 }
                 if (i < dcs.Length - 1) ImGui.SameLine();
+            }
+            if (!reachable)
+            {
+                ImGui.EndDisabled();
+                ImGui.SameLine();
+                ImGui.TextDisabled("(other region)");
             }
         }
 

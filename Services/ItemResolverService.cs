@@ -23,19 +23,25 @@ public sealed class ItemResolverService : IDisposable
     private const string XivapiCsvUrl    = "https://raw.githubusercontent.com/xivapi/ffxiv-datamining/master/csv/en/Item.csv";
     private const string TeamcraftJsonUrl = "https://raw.githubusercontent.com/ffxiv-teamcraft/ffxiv-teamcraft/master/libs/data/src/lib/json/items.json";
     private const string WorldCsvUrl     = "https://raw.githubusercontent.com/xivapi/ffxiv-datamining/master/csv/en/World.csv";
+    private const string GilShopItemCsvUrl = "https://raw.githubusercontent.com/xivapi/ffxiv-datamining/master/csv/en/GilShopItem.csv";
     private const double CacheTtlHours   = 24;
 
     private readonly HttpClient  _http;
     private readonly IPluginLog  _log;
     private readonly string      _cacheDir;
 
-    // item name (lower) → item ID, and the reverse id → proper-case name
+    // item name (lower) -> item ID, and the reverse id -> proper-case name
     private Dictionary<string, int> _itemMap   = [];
     private Dictionary<int, string> _itemNames = [];
     private Dictionary<int, WorldInfo> _worldMap = [];
+    // Item IDs sold by any gil-shop NPC vendor (so they need not be bought off the market board).
+    private HashSet<int> _npcSoldItemIds = [];
 
     public bool IsItemDataLoaded => _itemMap.Count > 0;
     public bool IsWorldDataLoaded => _worldMap.Count > 0;
+
+    /// <summary>True if the item is sold by an NPC vendor for gil.</summary>
+    public bool IsNpcSold(int itemId) => _npcSoldItemIds.Contains(itemId);
 
     /// <summary>Canonical (proper-case) display name for an item ID, if known.</summary>
     public string? GetItemName(int id) => _itemNames.GetValueOrDefault(id);
@@ -45,7 +51,7 @@ public sealed class ItemResolverService : IDisposable
     /// </summary>
     public IReadOnlyDictionary<int, string> ItemNames => _itemNames;
 
-    /// <summary>User-pinned name→id overrides, consulted before fuzzy matching.</summary>
+    /// <summary>User-pinned name->id overrides, consulted before fuzzy matching.</summary>
     public Dictionary<string, int> Overrides { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -67,7 +73,7 @@ public sealed class ItemResolverService : IDisposable
     private static readonly string[] SectionKeywords =
         ["furniture", "dyes", "====================="];
 
-    // ── Dye colour → purchaseable item name ───────────────────────────────────
+    // ── Dye colour -> purchaseable item name ───────────────────────────────────
     // Sourced from the in-game dye consolidation: most classic colours now share
     // "Standard Spectrum Dye"; the extended palette uses Spectrum #1/#2; and the
     // special/metallic shades retain their individual General-purpose items.
@@ -423,7 +429,7 @@ public sealed class ItemResolverService : IDisposable
         return (line, 1);
     }
 
-    // ── Name → ID resolution ─────────────────────────────────────────────────
+    // ── Name -> ID resolution ─────────────────────────────────────────────────
 
     private void Resolve(ShoppingItem item)
     {
@@ -475,8 +481,8 @@ public sealed class ItemResolverService : IDisposable
             item.ResolveQuality   = ResolveQuality.FuzzyMatch;
             item.ResolvedItemName = _itemNames.GetValueOrDefault(bestId) ?? bestKey;
             item.FuzzyDistance    = best;
-            item.ResolveWarning   = $"Fuzzy match: '{item.Name}' → '{item.ResolvedItemName}' (dist {best})";
-            _log.Warning($"[HMS] Fuzzy matched '{item.Name}' → '{bestKey}' (id {bestId})");
+            item.ResolveWarning   = $"Fuzzy match: '{item.Name}' -> '{item.ResolvedItemName}' (dist {best})";
+            _log.Warning($"[HMS] Fuzzy matched '{item.Name}' -> '{bestKey}' (id {bestId})");
             return;
         }
 
@@ -491,11 +497,13 @@ public sealed class ItemResolverService : IDisposable
     {
         var xivapiPath    = Path.Combine(_cacheDir, "items_xivapi.cache");
         var teamcraftPath = Path.Combine(_cacheDir, "items_teamcraft.cache");
+        var gilshopPath   = Path.Combine(_cacheDir, "gilshop.cache");
 
         var xivapiTask    = FetchCachedAsync(XivapiCsvUrl,    xivapiPath,    ct);
         var teamcraftTask = FetchCachedAsync(TeamcraftJsonUrl, teamcraftPath, ct);
+        var gilshopTask   = FetchCachedAsync(GilShopItemCsvUrl, gilshopPath,  ct);
 
-        await Task.WhenAll(xivapiTask, teamcraftTask);
+        await Task.WhenAll(xivapiTask, teamcraftTask, gilshopTask);
 
         var merged = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var names  = new Dictionary<int, string>();
@@ -506,9 +514,15 @@ public sealed class ItemResolverService : IDisposable
         if (teamcraftTask.Result is { } tcText)
             ParseTeamcraftJson(tcText, merged, names);
 
-        _itemMap   = merged;
-        _itemNames = names;
-        _log.Information($"[HMS] Item map loaded: {_itemMap.Count} entries");
+        var npcSold = new HashSet<int>();
+        if (gilshopTask.Result is { } gsText)
+            ParseGilShopCsv(gsText, npcSold);
+
+        _itemMap        = merged;
+        _itemNames      = names;
+        _npcSoldItemIds = npcSold;
+        _log.Information($"[HMS] Item map loaded: {_itemMap.Count} entries; " +
+                         $"{_npcSoldItemIds.Count} NPC-sold items");
     }
 
     private async Task LoadWorldDataAsync(CancellationToken ct)
@@ -600,6 +614,36 @@ public sealed class ItemResolverService : IDisposable
             if (string.IsNullOrWhiteSpace(name)) continue;
             map.TryAdd(name.ToLowerInvariant(), id);
             names.TryAdd(id, name);
+        }
+    }
+
+    private static void ParseGilShopCsv(string csv, HashSet<int> set)
+    {
+        // Format: header row "#,Item,QuestRequired[0],...", then data rows where
+        // column 0 is the shop subrow key (e.g. "262144.0") and column 1 is the item ID.
+        using var reader = new StringReader(csv);
+        string? line;
+        var headerParsed = false;
+        var itemCol = 1;
+
+        while ((line = reader.ReadLine()) != null)
+        {
+            var parts = SplitCsvLine(line);
+            if (!headerParsed)
+            {
+                headerParsed = true;
+                for (var i = 0; i < parts.Length; i++)
+                    if (parts[i].Trim().Equals("Item", StringComparison.OrdinalIgnoreCase))
+                    {
+                        itemCol = i;
+                        break;
+                    }
+                continue;
+            }
+
+            if (parts.Length <= itemCol) continue;
+            if (int.TryParse(parts[itemCol].Trim(), out var id) && id > 0)
+                set.Add(id);
         }
     }
 

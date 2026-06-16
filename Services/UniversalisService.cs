@@ -15,12 +15,15 @@ namespace HousingMarketShopper.Services;
 public sealed class UniversalisService : IDisposable
 {
     private const string BaseUrl      = "https://universalis.app/api/v2";
-    private const int    BatchSize    = 30;    // items per request — Universalis 504s on large batches
+    private const int    BatchSize    = 10;    // items per request — Universalis 504s on large batches
     private const int    MaxListings  = 20;    // listings per item per request
 
     private readonly HttpClient   _http;
     private readonly IPluginLog   _log;
     private readonly RateLimiter  _rate = new(20); // 20 req/s
+    // Cancelled on Dispose so in-flight fetches stop cleanly instead of spamming
+    // "Cannot access a disposed object" through the retry loop.
+    private readonly CancellationTokenSource _disposeCts = new();
 
     // ── Data-center / world catalogue ─────────────────────────────────────────
     public List<DataCenterInfo>   DataCenters { get; private set; } = [];
@@ -86,8 +89,10 @@ public sealed class UniversalisService : IDisposable
         foreach (var batch in batches)
         {
             var ids    = string.Join(',', batch);
+            // entries=0 skips the sale-history array (we only use listings) — a big cut in
+            // server work and payload, which reduces 504s on large fetches.
             var url    = $"{BaseUrl}/{Uri.EscapeDataString(dcName)}/{ids}" +
-                         $"?listings={MaxListings}&noGst=true";
+                         $"?listings={MaxListings}&entries=0&noGst=true";
             var json   = await _rate.ExecuteAsync(
                              () => FetchWithRetryAsync(url, ct), ct);
             if (json == null) continue;
@@ -227,20 +232,29 @@ public sealed class UniversalisService : IDisposable
 
     private async Task<string?> FetchWithRetryAsync(string url, CancellationToken ct)
     {
-        // Delays: 3s, 8s — long enough for a 504 gateway to recover between batches.
-        var retryDelays = new[] { 3, 8 };
+        // Delays: 3s, 8s, 15s — long enough for a 504 gateway to recover between batches.
+        var retryDelays = new[] { 3, 8, 15 };
 
         for (var attempt = 0; attempt <= retryDelays.Length; attempt++)
         {
             try
             {
-                return await _http.GetStringAsync(url, ct);
+                // Link the caller's token with the dispose token so unload aborts the fetch.
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _disposeCts.Token);
+                return await _http.GetStringAsync(url, linked.Token);
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException ||
+                                       (ex is OperationCanceledException && _disposeCts.IsCancellationRequested))
+            {
+                // Service was disposed (plugin unload/reload) — stop immediately, no retry/spam.
+                return null;
             }
             catch (Exception ex) when (attempt < retryDelays.Length)
             {
                 var delay = retryDelays[attempt];
                 _log.Warning($"[HMS] Attempt {attempt + 1} failed ({ex.Message}), retry in {delay}s");
-                await Task.Delay(TimeSpan.FromSeconds(delay), ct);
+                try { await Task.Delay(TimeSpan.FromSeconds(delay), ct); }
+                catch (OperationCanceledException) { return null; }
             }
             catch (Exception ex)
             {
@@ -250,7 +264,12 @@ public sealed class UniversalisService : IDisposable
         return null;
     }
 
-    public void Dispose() => _http.Dispose();
+    public void Dispose()
+    {
+        _disposeCts.Cancel();
+        _http.Dispose();
+        _disposeCts.Dispose();
+    }
 }
 
 // ── DTO models for Universalis catalogue ─────────────────────────────────────
