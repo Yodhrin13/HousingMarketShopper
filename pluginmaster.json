@@ -22,8 +22,8 @@
     "DownloadLinkInstall": "https://github.com/Yodhrin13/HousingMarketShopper/releases/latest/download/latest.zip",
     "DownloadLinkTesting": "https://github.com/Yodhrin13/HousingMarketShopper/releases/latest/download/latest.zip",
     "DownloadLinkUpdate": "https://github.com/Yodhrin13/HousingMarketShopper/releases/latest/download/latest.zip",
-    "LastUpdated": 1781574986,
-    "Changelog": "1.1.1\n- Fix: buying multiple of the same item now buys successive listings directly (like clicking the next row manually) instead of refetching between each unit — fixes the case where it bought one, stalled, then rerouted to another world even though stock remained\n- Fix: listing refresh after a purchase now reliably re-requests data (closes the results window first), with a full re-search fallback",
+    "LastUpdated": 1781652612,
+    "Changelog": "1.1.1\r\n- Fix: buying multiple of the same item now buys successive listings directly (like clicking the next row manually) instead of refetching between each unit — fixes the case where it bought one, stalled, then rerouted to another world even though stock remained\r\n- Fix: listing refresh after a purchase now reliably re-requests data (closes the results window first), with a full re-search fallback",
     "DownloadCount": 0
   }
 ]
