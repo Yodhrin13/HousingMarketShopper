@@ -132,11 +132,15 @@ public sealed class MarketboardService
             await SearchForItemAsync(itemId, itemName, ct);
 
             // ── Step 3: greedy purchase loop ─────────────────────────────────
-            var remaining = quantityNeeded;
-            var passes    = 0;          // guard against infinite loops
-            const int maxPasses = 10;
+            // Buy successive listings straight from the fetched set by their ListingId —
+            // exactly like clicking the next row manually after a purchase. No refresh is
+            // needed between units because the remaining listings stay in the proxy with the
+            // same IDs. We only re-fetch when this batch is fully consumed but more is needed.
+            var remaining    = quantityNeeded;
+            var outerPasses  = 0;
+            var maxOuterPasses = quantityNeeded + 3;   // backstop for re-fetch cycles
 
-            while (remaining > 0 && passes++ < maxPasses)
+            while (remaining > 0 && outerPasses++ < maxOuterPasses)
             {
                 ct.ThrowIfCancellationRequested();
 
@@ -147,21 +151,17 @@ public sealed class MarketboardService
                     break;
                 }
 
-                // Filter and sort candidates
+                // Filter and sort candidates (prefer NQ, relax to HQ only if needed).
                 var candidates = listings
                     .Where(l => l.PricePerUnit <= maxPricePerUnit
                              && (!_config.PreferNQ || !l.IsHQ))
                     .OrderBy(l => l.PricePerUnit)
                     .ToList();
-
-                // If nothing under budget with NQ preference, relax HQ restriction
                 if (candidates.Count == 0 && _config.PreferNQ)
-                {
                     candidates = listings
                         .Where(l => l.PricePerUnit <= maxPricePerUnit)
                         .OrderBy(l => l.PricePerUnit)
                         .ToList();
-                }
 
                 if (candidates.Count == 0)
                 {
@@ -170,24 +170,52 @@ public sealed class MarketboardService
                     break;
                 }
 
-                // Purchase from the cheapest listing, taking as many as needed
-                var listing = candidates[0];
-                var buyQty  = Math.Min(listing.Quantity, remaining);
+                // Buy down this batch listing-by-listing, no refresh in between.
+                var boughtThisBatch = 0;
+                foreach (var listing in candidates)
+                {
+                    if (remaining <= 0) break;
+                    ct.ThrowIfCancellationRequested();
 
-                _log.Debug($"[HMS] Buying {buyQty}× {itemName} @ " +
-                           $"{listing.PricePerUnit:N0} from {listing.RetainerName}");
+                    var buyQty = Math.Min(listing.Quantity, remaining);
+                    _log.Debug($"[HMS] Buying {buyQty}× {itemName} @ " +
+                               $"{listing.PricePerUnit:N0} from {listing.RetainerName}");
 
-                var purchased = await PurchaseListingAsync(
-                    listing, buyQty, itemId, itemName, ct);
+                    var ok = await _framework.RunOnFrameworkThread(
+                        () => InitiatePurchaseUnsafe(listing.InGameListingId, listing.PricePerUnit, buyQty));
+                    if (!ok)
+                        continue; // price drift or listing gone from proxy — try the next one
 
-                if (!purchased) break; // price changed or listing not found
+                    quantityPurchased += buyQty;
+                    totalSpent        += listing.PricePerUnit * buyQty;
+                    remaining         -= buyQty;
+                    boughtThisBatch   += buyQty;
 
-                quantityPurchased += buyQty;
-                totalSpent        += listing.PricePerUnit * buyQty;
-                remaining         -= buyQty;
+                    // Let the server settle each purchase before the next (as a human would).
+                    if (remaining > 0)
+                        await Task.Delay(Math.Max(_config.NavigationDelayMs, 2_000), ct);
+                }
 
-                if (remaining > 0)
-                    await Task.Delay(_config.NavigationDelayMs, ct);
+                if (remaining <= 0) break;
+
+                // Nothing bought from this batch — listings are stale/gone; stop rather than spin.
+                if (boughtThisBatch == 0)
+                {
+                    _log.Information($"[HMS] No purchasable listings left for {itemName}.");
+                    break;
+                }
+
+                // Batch consumed but more still needed — refresh once and continue.
+                try
+                {
+                    await RefreshListingsAsync(itemId, itemName, ct);
+                }
+                catch (MarketboardStateException)
+                {
+                    _log.Information($"[HMS] Light refresh failed for '{itemName}' — falling back to full re-search.");
+                    try { await SearchForItemAsync(itemId, itemName, ct); }
+                    catch (MarketboardStateException) { _lastOfferings = []; }
+                }
             }
         }
         catch (OperationCanceledException)
@@ -393,9 +421,15 @@ public sealed class MarketboardService
     }
 
     /// <summary>
-    /// Re-requests the listing packet for an already-selected item without
-    /// re-running the text search. Used between purchases of the same item.
+    /// Re-requests the listing packet for an already-selected item without re-running the
+    /// text search. Used between purchases of the same item.
     /// </summary>
+    /// <remarks>
+    /// The ItemSearchResult addon must be closed first: re-dispatching a ListItemClick while
+    /// ISR is still open showing the same item is a no-op — the game does not send a fresh
+    /// server request, so OfferingsReceived never fires. Closing ISR makes the click reopen
+    /// it and re-request, which is the cheap refresh (no RunSearch) we want.
+    /// </remarks>
     private async Task RefreshListingsAsync(uint itemId, string itemName, CancellationToken ct)
     {
         _offeringsItemId = itemId;
@@ -404,6 +438,9 @@ public sealed class MarketboardService
 
         try
         {
+            await _framework.RunOnFrameworkThread(() => CloseAddonUnsafe(AddonItemSearchResult));
+            await Task.Delay(300, ct);
+
             await _framework.RunOnFrameworkThread(() => RequestItemListingsUnsafe(itemId));
 
             _lastOfferings = await AwaitOfferingsAsync(itemId, itemName, ct);
@@ -433,6 +470,9 @@ public sealed class MarketboardService
                 _log.Information($"[HMS] No offerings response after 5 s — re-dispatching listing request for '{itemName}'.");
                 _offeringsTcs = new TaskCompletionSource<IReadOnlyList<IMarketBoardItemListing>>(
                     TaskCreationOptions.RunContinuationsAsynchronously);
+                // Close ISR before re-clicking — a click on an already-open ISR won't re-request.
+                await _framework.RunOnFrameworkThread(() => CloseAddonUnsafe(AddonItemSearchResult));
+                await Task.Delay(300, ct);
                 await _framework.RunOnFrameworkThread(() => RequestItemListingsUnsafe(itemId));
             }
 
@@ -527,38 +567,6 @@ public sealed class MarketboardService
     // =========================================================================
     // Step 4 — Purchase via InfoProxyItemSearch.SendPurchaseRequestPacket()
     // =========================================================================
-
-    private async Task<bool> PurchaseListingAsync(
-        MarketListing     listing,
-        int               buyQty,
-        uint              itemId,
-        string            itemName,
-        CancellationToken ct)
-    {
-        var ok = await _framework.RunOnFrameworkThread(
-            () => InitiatePurchaseUnsafe(listing.InGameListingId, listing.PricePerUnit, buyQty));
-
-        if (!ok) return false;
-
-        // Allow the server round-trip + settle time.
-        await Task.Delay(Math.Max(_config.NavigationDelayMs, 2_000), ct);
-
-        // Re-request listings so the next loop iteration has fresh data.
-        // We only need to re-dispatch the listing request — RunSearch is not
-        // needed again because the item is already selected in the results list.
-        try
-        {
-            await RefreshListingsAsync(itemId, itemName, ct);
-        }
-        catch (MarketboardStateException)
-        {
-            // If refresh fails (e.g. item sold out), leave _lastOfferings empty
-            // so the outer loop sees 0 listings and exits cleanly.
-            _lastOfferings = [];
-        }
-
-        return true;
-    }
 
     private unsafe bool InitiatePurchaseUnsafe(ulong listingId, int expectedPpu, int buyQty)
     {

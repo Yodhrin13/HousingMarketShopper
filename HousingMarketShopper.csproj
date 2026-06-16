@@ -3,7 +3,7 @@
   <PropertyGroup>
     <RootNamespace>HousingMarketShopper</RootNamespace>
     <AssemblyName>HousingMarketShopper</AssemblyName>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
     <!-- Required for the STA-thread Windows file-picker dialog in MainWindow. -->
     <UseWindowsForms>true</UseWindowsForms>
     <!-- CS8500: expected when declaring pointers to FFXIVClientStructs types that
