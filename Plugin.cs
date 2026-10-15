@@ -46,6 +46,7 @@ public sealed class Plugin : IDalamudPlugin
         ITargetManager          targetManager,
         IObjectTable            objects,
         IMarketBoard            marketBoard,
+        ICondition              condition,
         IPluginLog              log)
     {
         _pi       = pi;
@@ -62,7 +63,8 @@ public sealed class Plugin : IDalamudPlugin
         _universalis = new UniversalisService(log);
         _marketboard = new MarketboardService(
             gameGui, framework, targetManager, objects, marketBoard, _config, log);
-        _navSvc      = new NavigationService(pi, commands, framework, _marketboard, objects, clientState, _config, log);
+        _navSvc      = new NavigationService(pi, commands, framework, _marketboard, objects,
+                                             clientState, condition, gameGui, _config, log);
         _shopList    = new ShoppingListService(pi, _resolver, _universalis, _config, log);
 
         NavigationService = _navSvc;

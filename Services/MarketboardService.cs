@@ -181,15 +181,18 @@ public sealed class MarketboardService
                     _log.Debug($"[HMS] Buying {buyQty}× {itemName} @ " +
                                $"{listing.PricePerUnit:N0} from {listing.RetainerName}");
 
-                    var ok = await _framework.RunOnFrameworkThread(
+                    var bought = await _framework.RunOnFrameworkThread(
                         () => InitiatePurchaseUnsafe(listing.InGameListingId, listing.PricePerUnit, buyQty));
-                    if (!ok)
+                    if (bought == null)
                         continue; // price drift or listing gone from proxy — try the next one
 
-                    quantityPurchased += buyQty;
-                    totalSpent        += listing.PricePerUnit * buyQty;
-                    remaining         -= buyQty;
-                    boughtThisBatch   += buyQty;
+                    // Record what was actually paid/bought (price may have drifted within
+                    // tolerance; proxy quantity may be lower than the snapshot's).
+                    var (actualPpu, actualQty) = bought.Value;
+                    quantityPurchased += actualQty;
+                    totalSpent        += actualPpu * actualQty;
+                    remaining         -= actualQty;
+                    boughtThisBatch   += actualQty;
 
                     // Let the server settle each purchase before the next (as a human would).
                     if (remaining > 0)
@@ -568,12 +571,18 @@ public sealed class MarketboardService
     // Step 4 — Purchase via InfoProxyItemSearch.SendPurchaseRequestPacket()
     // =========================================================================
 
-    private unsafe bool InitiatePurchaseUnsafe(ulong listingId, int expectedPpu, int buyQty)
+    /// <summary>
+    /// Sends the purchase packet for a listing. Returns the actual per-unit price and
+    /// quantity bought (which may differ from the snapshot within the drift tolerance),
+    /// or null if the listing is gone, the price drifted too far, or the send failed.
+    /// </summary>
+    private unsafe (int actualPpu, int actualQty)? InitiatePurchaseUnsafe(
+        ulong listingId, int expectedPpu, int buyQty)
     {
         var agent = AgentItemSearch.Instance();
-        if (agent == null) return false;
+        if (agent == null) return null;
         var proxy = agent->InfoProxyItemSearch;
-        if (proxy == null) return false;
+        if (proxy == null) return null;
 
         // Find the listing in the proxy by ListingId so we have ContainerIndex.
         var count       = (int)proxy->ListingCount;
@@ -593,7 +602,7 @@ public sealed class MarketboardService
         if (target == null)
         {
             _log.Warning($"[HMS] ListingId {listingId} not found in proxy; proxy has {count} entries.");
-            return false;
+            return null;
         }
 
         var actualPpu = (int)target->UnitPrice;
@@ -602,20 +611,19 @@ public sealed class MarketboardService
             _log.Warning(
                 $"[HMS] Price too high: expected {expectedPpu:N0}, actual {actualPpu:N0} " +
                 $"(>{MaxPricePremium:P0} premium) — skipping listing.");
-            return false;
+            return null;
         }
         if (actualPpu != expectedPpu)
             _log.Information($"[HMS] Price adjusted {expectedPpu:N0} → {actualPpu:N0} (within tolerance).");
 
+        var actualQty = Math.Min(buyQty, (int)target->Quantity);
         proxy->SetLastPurchasedItem(target);
-        proxy->LastPurchasedMarketboardItem.Quantity =
-            (uint)Math.Min(buyQty, (int)target->Quantity);
+        proxy->LastPurchasedMarketboardItem.Quantity = (uint)actualQty;
 
         var sent = proxy->SendPurchaseRequestPacket();
         _log.Debug(
-            $"[HMS] SendPurchaseRequestPacket() → {sent}; " +
-            $"{proxy->LastPurchasedMarketboardItem.Quantity}× @ {target->UnitPrice:N0} gil.");
-        return sent;
+            $"[HMS] SendPurchaseRequestPacket() → {sent}; {actualQty}× @ {actualPpu:N0} gil.");
+        return sent ? (actualPpu, actualQty) : null;
     }
 
     // =========================================================================

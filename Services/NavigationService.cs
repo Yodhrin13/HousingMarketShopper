@@ -9,6 +9,7 @@ using Dalamud.Plugin;
 using Dalamud.Plugin.Ipc;
 using Dalamud.Plugin.Services;
 using Dalamud.Game.ClientState;
+using Dalamud.Game.ClientState.Conditions;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using HousingMarketShopper.Models;
 
@@ -30,8 +31,14 @@ public sealed class NavigationService : IDisposable
     private readonly MarketboardService _mb;
     private readonly IObjectTable       _objects;
     private readonly IClientState       _clientState;
+    private readonly ICondition         _condition;
+    private readonly IGameGui           _gameGui;
     private readonly IPluginLog         _log;
     private readonly Configuration      _cfg;
+
+    // Ul'dah - Steps of Nald / Steps of Thal
+    private const ushort UldahNald = 130;
+    private const ushort UldahThal = 131;
 
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -78,6 +85,10 @@ public sealed class NavigationService : IDisposable
     /// <summary>Human-readable summary of the saved run, for the resume banner.</summary>
     public string? SavedRunInfo { get; private set; }
 
+    // Linked with the caller's token each run so Stop() can abort the loop from
+    // anywhere (e.g. the confirm dialog's Abort button), not just the owner's CTS.
+    private CancellationTokenSource? _runCts;
+
     public event Action? StateChanged;
 
     private sealed class RunStateDto
@@ -107,6 +118,8 @@ public sealed class NavigationService : IDisposable
         MarketboardService      mb,
         IObjectTable            objects,
         IClientState            clientState,
+        ICondition              condition,
+        IGameGui                gameGui,
         Configuration           cfg,
         IPluginLog              log)
     {
@@ -115,6 +128,8 @@ public sealed class NavigationService : IDisposable
         _mb          = mb;
         _objects     = objects;
         _clientState = clientState;
+        _condition   = condition;
+        _gameGui     = gameGui;
         _cfg         = cfg;
         _log         = log;
         _runStatePath = Path.Combine(pi.GetPluginConfigDirectory(), "runstate.json");
@@ -137,6 +152,12 @@ public sealed class NavigationService : IDisposable
         Func<ShoppingItem, Task<bool>> confirmHighValue,
         CancellationToken ct = default)
     {
+        // Link an internal CTS so Stop() cancels the loop even when invoked from
+        // code that doesn't own the caller's token (e.g. ConfirmPurchaseWindow).
+        _runCts?.Dispose();
+        _runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        ct = _runCts.Token;
+
         IsRunning           = true;
         IsPaused            = false;
         TotalActualSpend    = 0;
@@ -158,9 +179,6 @@ public sealed class NavigationService : IDisposable
         try
         {
             var congestedWorlds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            // Flatten plan worlds once for look-ahead calculations.
-            var allPlanWorlds = plan.Groups.SelectMany(g => g.Worlds).ToList();
 
             for (var dcIdx = 0; dcIdx < plan.Groups.Count; dcIdx++)
             {
@@ -426,7 +444,17 @@ public sealed class NavigationService : IDisposable
 
     public void Pause()  { IsPaused = true;  StateChanged?.Invoke(); }
     public void Resume() { IsPaused = false; StateChanged?.Invoke(); }
-    public void Stop()   { IsRunning = false; IsPaused = false; StateChanged?.Invoke(); }
+
+    /// <summary>
+    /// Aborts the active run. Cancels the internal run token, so this works from any
+    /// caller (confirm dialog, UI button) — the loop's finally block resets IsRunning.
+    /// </summary>
+    public void Stop()
+    {
+        _runCts?.Cancel();
+        IsPaused = false;
+        StateChanged?.Invoke();
+    }
 
     // ── Navigation primitives ─────────────────────────────────────────────────
 
@@ -443,15 +471,22 @@ public sealed class NavigationService : IDisposable
         await WaitForLifestreamAsync(ct);
         var arrived = await WaitForWorldAsync(worldName, ct);
         if (arrived)
+        {
+            // CurrentWorld flips while still behind the loading screen — wait until the
+            // zone is actually loaded and Lifestream has finished before doing anything else.
+            await WaitForPlayerReadyAsync(ct);
             await Task.Delay(_cfg.NavigationDelayMs, ct);
+        }
         return arrived;
     }
 
     private async Task NavigateToMarketboardAsync(CancellationToken ct)
     {
-        // Ul'dah - Steps of Nald = 130, Steps of Thal = 131
+        // Never act until the previous travel/teleport has fully settled.
+        await WaitForPlayerReadyAsync(ct);
+
         var territory = await _framework.RunOnFrameworkThread(() => _clientState.TerritoryType);
-        if (territory != 130 && territory != 131)
+        if (territory != UldahNald && territory != UldahThal)
         {
             LogAction("Teleporting to Ul'dah…", LogTag.Navigation);
             try
@@ -461,25 +496,51 @@ public sealed class NavigationService : IDisposable
             }
             catch (Exception ex) { _log.Warning($"[HMS] Ul'dah teleport error: {ex.Message}"); }
 
-            await WaitForLifestreamAsync(ct);
-            await Task.Delay(_cfg.NavigationDelayMs, ct);
+            // Wait for the zone to actually change, then for the load to finish.
+            // (Lifestream can report idle during the loading screen itself.)
+            if (!await WaitForTerritoryAsync([UldahNald, UldahThal], 60_000, ct))
+                _log.Warning("[HMS] Timed out waiting to arrive in Ul'dah.");
+            await WaitForPlayerReadyAsync(ct);
         }
 
-        // Brief settle so Lifestream is ready to accept a new command after world travel.
-        await Task.Delay(2_000, ct);
-
-        LogAction("Moving to marketboard…", LogTag.Navigation);
-        try
+        // Issue /li mb, retrying if Lifestream never picks it up (e.g. it arrived while
+        // the game was still settling and the command was silently dropped).
+        const int maxAttempts = 3;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            await _framework.RunOnFrameworkThread(
-                () => _commands.ProcessCommand("/li mb"));
-        }
-        catch (Exception ex) { _log.Warning($"[HMS] MB navigation error: {ex.Message}"); }
+            ct.ThrowIfCancellationRequested();
+            await WaitForPlayerReadyAsync(ct);
 
-        // Wait for Lifestream to open ItemSearch (it navigates to the board AND opens it).
-        var opened = await _mb.WaitForItemSearchOpenAsync(90_000, ct);
-        if (!opened)
-            _log.Warning("[HMS] Timed out waiting for ItemSearch to open after /li mb.");
+            LogAction(attempt == 1
+                ? "Moving to marketboard…"
+                : $"Retrying marketboard navigation (attempt {attempt}/{maxAttempts})…",
+                LogTag.Navigation);
+            try
+            {
+                await _framework.RunOnFrameworkThread(
+                    () => _commands.ProcessCommand("/li mb"));
+            }
+            catch (Exception ex) { _log.Warning($"[HMS] MB navigation error: {ex.Message}"); }
+
+            // Did Lifestream accept the command? It should go busy (or open the MB) quickly.
+            if (!await WaitForMbNavigationStartAsync(6_000, ct))
+            {
+                _log.Information($"[HMS] /li mb not picked up (attempt {attempt}) — retrying.");
+                await Task.Delay(1_500, ct);
+                continue;
+            }
+
+            // Lifestream walks to the board and opens it — give it time to arrive.
+            if (await _mb.WaitForItemSearchOpenAsync(60_000, ct))
+            {
+                await Task.Delay(_cfg.NavigationDelayMs, ct);
+                return;
+            }
+
+            _log.Information($"[HMS] Marketboard did not open after /li mb (attempt {attempt}).");
+        }
+
+        _log.Warning("[HMS] Could not open the marketboard via Lifestream — will try nearest board directly.");
         await Task.Delay(_cfg.NavigationDelayMs, ct);
     }
 
@@ -524,6 +585,115 @@ public sealed class NavigationService : IDisposable
     }
 
     // ── Wait helpers ──────────────────────────────────────────────────────────
+
+    private bool IsLifestreamBusy()
+    {
+        try   { return _lifestreamIsBusy?.InvokeFunc() ?? false; }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// True when the player is loaded in and free to act: not between areas, not casting
+    /// or in a cutscene, no loading/fade screen up. Must run on the framework thread.
+    /// </summary>
+    private bool IsPlayerReadyUnsafe()
+    {
+        if (_objects.LocalPlayer == null) return false;
+
+        if (_condition[ConditionFlag.BetweenAreas]
+            || _condition[ConditionFlag.BetweenAreas51]
+            || _condition[ConditionFlag.BeingMoved]
+            || _condition[ConditionFlag.Casting]
+            || _condition[ConditionFlag.OccupiedInCutSceneEvent]
+            || _condition[ConditionFlag.WatchingCutscene])
+            return false;
+
+        // Loading / fade overlays linger briefly after BetweenAreas clears.
+        return !AddonWaiter.IsAddonVisible(_gameGui, "NowLoading")
+            && !AddonWaiter.IsAddonVisible(_gameGui, "FadeMiddle")
+            && !AddonWaiter.IsAddonVisible(_gameGui, "FadeBack");
+    }
+
+    /// <summary>
+    /// Waits until the player is ready (see <see cref="IsPlayerReadyUnsafe"/>) and Lifestream
+    /// is idle, and that state has held continuously for a short settle window. Gives up
+    /// after <paramref name="timeoutMs"/> (keeps waiting indefinitely while paused).
+    /// </summary>
+    private async Task WaitForPlayerReadyAsync(CancellationToken ct, int timeoutMs = 120_000)
+    {
+        const int stableMs = 1_500;
+        var deadline    = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        DateTime? readySince = null;
+
+        while (!ct.IsCancellationRequested)
+        {
+            if (IsPaused)
+            {
+                deadline   = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+                readySince = null;
+                await Task.Delay(500, ct);
+                continue;
+            }
+
+            bool ready;
+            try   { ready = await _framework.RunOnFrameworkThread(IsPlayerReadyUnsafe) && !IsLifestreamBusy(); }
+            catch { ready = false; }
+
+            if (ready)
+            {
+                readySince ??= DateTime.UtcNow;
+                if ((DateTime.UtcNow - readySince.Value).TotalMilliseconds >= stableMs)
+                    return;
+            }
+            else
+            {
+                readySince = null;
+            }
+
+            if (DateTime.UtcNow > deadline)
+            {
+                _log.Warning("[HMS] Timed out waiting for player to be ready — continuing anyway.");
+                return;
+            }
+
+            await Task.Delay(250, ct);
+        }
+        ct.ThrowIfCancellationRequested();
+    }
+
+    /// <summary>Polls until the current territory is one of <paramref name="territories"/>.</summary>
+    private async Task<bool> WaitForTerritoryAsync(ushort[] territories, int timeoutMs, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            var current = await _framework.RunOnFrameworkThread(() => _clientState.TerritoryType);
+            if (Array.IndexOf(territories, current) >= 0) return true;
+            await Task.Delay(500, ct);
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// After issuing <c>/li mb</c>, returns true once Lifestream goes busy (it accepted the
+    /// command and is walking) or the marketboard is already open; false if neither happens
+    /// within <paramref name="timeoutMs"/> — i.e. the command was dropped.
+    /// </summary>
+    private async Task<bool> WaitForMbNavigationStartAsync(int timeoutMs, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (IsLifestreamBusy()) return true;
+            var mbOpen = await _framework.RunOnFrameworkThread(
+                () => AddonWaiter.IsAddonVisible(_gameGui, "ItemSearch"));
+            if (mbOpen) return true;
+            await Task.Delay(250, ct);
+        }
+        return false;
+    }
 
     private async Task WaitForLifestreamAsync(CancellationToken ct)
     {
@@ -833,5 +1003,9 @@ public sealed class NavigationService : IDisposable
         StateChanged?.Invoke();
     }
 
-    public void Dispose() { }
+    public void Dispose()
+    {
+        _runCts?.Cancel();
+        _runCts?.Dispose();
+    }
 }

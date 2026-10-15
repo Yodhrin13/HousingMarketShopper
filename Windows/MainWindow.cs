@@ -165,16 +165,26 @@ public sealed class MainWindow : Window, IDisposable
         if (ImGui.Button("Deselect All"))
             foreach (var i in _shopList.LoadedItems) i.Excluded = true;
         ImGui.SameLine();
+        // Hold Ctrl to guard against an accidental click wiping the list.
+        if (ImGui.Button("Clear List") && ImGui.GetIO().KeyCtrl)
+            _shopList.LoadedItems.Clear();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Ctrl+Click to remove all loaded items");
+        ImGui.SameLine();
         ImGui.TextDisabled("  Uncheck items to skip them from the plan (e.g. sourcing elsewhere)");
 
         ImGui.Spacing();
 
         if (ImGui.BeginChild("##itemList", new Vector2(0, -1), true))
         {
+            ShoppingItem? toRemove = null;
             for (var idx = 0; idx < _shopList.LoadedItems.Count; idx++)
-                DrawItemRow(_shopList.LoadedItems[idx], idx);
-            ImGui.EndChild();
+                if (DrawItemRow(_shopList.LoadedItems[idx], idx))
+                    toRemove = _shopList.LoadedItems[idx];
+            if (toRemove != null)
+                _shopList.LoadedItems.Remove(toRemove);
         }
+        ImGui.EndChild();
 
         DrawResolvePicker();
     }
@@ -221,8 +231,8 @@ public sealed class MainWindow : Window, IDisposable
                     break;
                 }
             }
-            ImGui.EndChild();
         }
+        ImGui.EndChild();
     }
 
     // ── Saved lists ───────────────────────────────────────────────────────────
@@ -312,15 +322,25 @@ public sealed class MainWindow : Window, IDisposable
                     break;
                 }
             }
-            ImGui.EndChild();
         }
+        ImGui.EndChild();
 
         if (ImGui.Button("Cancel")) ImGui.CloseCurrentPopup();
         ImGui.EndPopup();
     }
 
-    private void DrawItemRow(ShoppingItem item, int idx)
+    /// <summary>Draws one item row. Returns true when the user clicked its remove button.</summary>
+    private bool DrawItemRow(ShoppingItem item, int idx)
     {
+        var removeRequested = false;
+
+        // Remove button (X) — deletes the row from the loaded list entirely.
+        if (ImGui.SmallButton($"X##rm{idx}"))
+            removeRequested = true;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Remove this item from the list");
+        ImGui.SameLine();
+
         // Checkbox: checked = include in plan, unchecked = exclude
         var included = !item.Excluded;
         if (ImGui.Checkbox($"##incl{idx}", ref included))
@@ -393,6 +413,8 @@ public sealed class MainWindow : Window, IDisposable
                     "This furnishing is sold by an NPC vendor for gil —\n" +
                     "you can likely buy it directly instead of off the market board.");
         }
+
+        return removeRequested;
     }
 
     // ── Shopping list (plan) tab ───────────────────────────────────────────────
@@ -485,7 +507,12 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.Spacing();
         ImGui.Separator();
 
-        if (!ImGui.BeginChild("##planScroll", new Vector2(0, -1), false)) return;
+        if (!ImGui.BeginChild("##planScroll", new Vector2(0, -1), false))
+        {
+            // EndChild must be called even when BeginChild returns false.
+            ImGui.EndChild();
+            return;
+        }
 
         foreach (var dcGroup in plan.Groups)
         {
@@ -500,9 +527,11 @@ public sealed class MainWindow : Window, IDisposable
                 if (visibleItems.Count == 0) continue;
 
                 ImGui.Indent(12f);
+                // Show the cost of the visible (filtered) items so count and gil agree.
+                var visibleCost = visibleItems.Sum(i => i.TotalPrice);
                 var worldHeader =
                     $"{world.WorldName}  — {visibleItems.Count} items  " +
-                    $"(~{world.TotalEstimatedCost:N0} gil)";
+                    $"(~{visibleCost:N0} gil)";
                 if (!ImGui.CollapsingHeader(worldHeader, ImGuiTreeNodeFlags.DefaultOpen))
                 {
                     ImGui.Unindent(12f);
@@ -641,6 +670,12 @@ public sealed class MainWindow : Window, IDisposable
                     if (resumePlan.TotalItemCount > 0)
                         StartShopping(resumePlan);
                 }
+                else
+                {
+                    // Snapshot is unreadable/empty — discard it so the banner doesn't
+                    // linger with a button that silently does nothing.
+                    _nav.DiscardSavedRun();
+                }
             }
             if (!canResume) ImGui.EndDisabled();
             if (!canResume && ImGui.IsItemHovered())
@@ -649,9 +684,8 @@ public sealed class MainWindow : Window, IDisposable
             ImGui.SameLine();
             if (ImGui.Button("Discard##resume"))
                 _nav.DiscardSavedRun();
-
-            ImGui.EndChild();
         }
+        ImGui.EndChild();
         ImGui.PopStyleColor();
         ImGui.Spacing();
     }
@@ -772,8 +806,8 @@ public sealed class MainWindow : Window, IDisposable
                 }
                 ImGui.EndTable();
             }
-            ImGui.EndChild();
         }
+        ImGui.EndChild();
 
         if (ImGui.Button("Close")) ImGui.CloseCurrentPopup();
         ImGui.EndPopup();
@@ -825,8 +859,8 @@ public sealed class MainWindow : Window, IDisposable
                     _ = _nav.TeleportToDepositLocationAsync();
                 ImGui.SameLine();
                 if (ImGui.Button("Resume (I've deposited)")) _nav.Resume();
-                ImGui.EndChild();
             }
+            ImGui.EndChild();
             ImGui.PopStyleColor();
             ImGui.Spacing();
         }
@@ -852,7 +886,10 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.Spacing();
         ImGui.TextUnformatted($"Current: {_nav.CurrentAction}");
 
-        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 80);
+        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 160);
+        if (ImGui.Button("Copy Log"))
+            ImGui.SetClipboardText(string.Join("\n", _nav.Log.Select(e => e.Text)));
+        ImGui.SameLine();
         if (ImGui.Button("Clear Log"))
             _nav.Log.Clear();
 
@@ -877,8 +914,8 @@ public sealed class MainWindow : Window, IDisposable
                         : $"- {missed.Name}  ×{missed.QuantityNeeded}";
                     ImGui.TextUnformatted(label);
                 }
-                ImGui.EndChild();
             }
+            ImGui.EndChild();
 
             ImGui.Spacing();
             if (ImGui.Button("Copy Missed Items"))
@@ -907,27 +944,27 @@ public sealed class MainWindow : Window, IDisposable
             ImGui.Spacing();
         }
 
-        if (!ImGui.BeginChild("##navLog", new Vector2(0, -1), true)) return;
-
-        // Show log lines newest-first with color coding
-        for (var i = _nav.Log.Count - 1; i >= 0; i--)
+        if (ImGui.BeginChild("##navLog", new Vector2(0, -1), true))
         {
-            var entry = _nav.Log[i];
-            var color = entry.Tag switch
+            // Show log lines newest-first with color coding
+            for (var i = _nav.Log.Count - 1; i >= 0; i--)
             {
-                LogTag.Navigation => new Vector4(0.4f, 0.85f, 1f,   1f),  // light blue
-                LogTag.Purchase   => new Vector4(1f,   1f,   0.6f,  1f),  // pale yellow
-                LogTag.Success    => new Vector4(0.3f, 1f,   0.4f,  1f),  // green
-                LogTag.Partial    => new Vector4(1f,   0.85f, 0.2f, 1f),  // amber
-                LogTag.Warning    => new Vector4(1f,   0.6f, 0.1f,  1f),  // orange
-                LogTag.Error      => new Vector4(1f,   0.3f, 0.3f,  1f),  // red
-                _                 => new Vector4(0.85f,0.85f,0.85f, 1f),  // dim white
-            };
-            ImGui.PushStyleColor(ImGuiCol.Text, color);
-            ImGui.TextUnformatted(entry.Text);
-            ImGui.PopStyleColor();
+                var entry = _nav.Log[i];
+                var color = entry.Tag switch
+                {
+                    LogTag.Navigation => new Vector4(0.4f, 0.85f, 1f,   1f),  // light blue
+                    LogTag.Purchase   => new Vector4(1f,   1f,   0.6f,  1f),  // pale yellow
+                    LogTag.Success    => new Vector4(0.3f, 1f,   0.4f,  1f),  // green
+                    LogTag.Partial    => new Vector4(1f,   0.85f, 0.2f, 1f),  // amber
+                    LogTag.Warning    => new Vector4(1f,   0.6f, 0.1f,  1f),  // orange
+                    LogTag.Error      => new Vector4(1f,   0.3f, 0.3f,  1f),  // red
+                    _                 => new Vector4(0.85f,0.85f,0.85f, 1f),  // dim white
+                };
+                ImGui.PushStyleColor(ImGuiCol.Text, color);
+                ImGui.TextUnformatted(entry.Text);
+                ImGui.PopStyleColor();
+            }
         }
-
         ImGui.EndChild();
     }
 
